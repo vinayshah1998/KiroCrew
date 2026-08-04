@@ -442,3 +442,73 @@ Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
 `register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`;
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
+
+## 13. An app token's WebSocket stream is scoped by its manifest, deny-by-default
+
+`/api/ws` is the third surface an app token reaches, alongside the HTTP API and
+MCP. Connecting grants no events by itself: the socket records the caller's app
+identity and its `permissions.events` declarations, and every fan-out is filtered
+per socket at ONE chokepoint — `DashboardState._send_ws_all` →
+`_ws_client_allowed` → `dashboard/ws_event_scope.py`. Both dispatch paths
+(`broadcast_ws` and the `_broadcast` `_type` translation) and the
+subagent-subscriber fan-out funnel through it. An event absent from the module's
+tables is DENIED, so a new event name is a silent loss of function for apps until
+it is classified — `test_ws_event_scoping.py` fails the build on an unclassified
+broadcast name rather than letting it reach production.
+
+Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
+sensitive payload and always delivers. Tier 1 is slot-scoped: visibility follows
+the slot's `SlotOrigin` and the app's `slots:*` declarations (`slots:own` is the
+default, then `slots:user`, `slots:app:<name>`, `slots:all`), with `subagent:*` an
+independent dimension so an app can watch subagent status without receiving chat
+content. Tier 2 is global and needs an explicit declaration; notifications split
+by source, so `notification` covers the app's own pushes while gateway-internal
+ones (cron output, `send_message`, watchlist results) require
+`notification:system` — bundling them would make one declaration a broad grant.
+
+**`SlotOrigin` is declared by the layer that knows it, never derived.**
+`get_or_create_slot` cannot distinguish a person typing from a background
+injection, so it leaves an undeclared non-app slot UNTAGGED (`""`) instead of
+calling it USER. The request layer decides USER/APP because only it sees whether
+an app token was presented; background callers pass CRON/SYSTEM explicitly. `""`
+is invisible to every cross-slot scope, so a caller that forgets to declare loses
+visibility rather than leaking. The origin round-trips through session metadata:
+both the write (`_save_slot_to_history`) and the restore (the rehydrate paths) are
+required, or every slot comes back unattributed after a restart.
+
+**Cross-app visibility is mutual.** `slots:app:X` also requires X's manifest to
+name the observer in `permissions.exposeToApps`, so an app cannot name a sibling
+unilaterally. That list is read through a stale-while-revalidate cache because the
+gate is synchronous and sits on the broadcast hot path: it never reads the disk
+itself, a cold miss denies (fail-closed) and schedules an off-loop refresh, and a
+stale entry serves the previous value while refreshing.
+
+**A grant that is not a list denies.** `permissions.api`, `events`, `mcpTools` and
+`exposeToApps` are list-valued; a JSON scalar is refused rather than coerced,
+because iterating a string yields its characters (`"*"` → the wildcard, and
+`"/api/chat"` → the prefix `"/"`, which matches every path).
+
+**Filtering the frame is not always enough.** Two event shapes carry other
+tenants' data inside a payload the gate admits wholesale, so they are narrowed on
+the send path in `_serialize_for_client`: the `slots` re-push (a full slot list)
+and the coalesced `subagent_batch_*` frames (one frame, many subagents' rows, no
+single slot to judge). The `slots` envelope additionally carries global
+safety-posture booleans that no slot scope narrows — `yolo` rides the same
+declaration that gates `yolo_expired`, and `channelTrusted` is withheld from app
+tokens outright. A withheld field is OMITTED, never sent as `false`, because a
+falsy default still answers a question the app must not ask.
+
+`_APP_TOKEN_IMPLICIT_ALLOW` holds `/api/ws` alone. An endpoint belongs there only
+with a compensating per-response control — event scoping is that control for
+`/api/ws` — so `/api/status` is not in it despite being a liveness probe: it
+returns owner hash, host specs, cron and usage stats, and the live safety-override
+state, and an app that wants it declares it in `permissions.api`.
+
+Writers: `dashboard/ws_event_scope.py`, `dashboard/ws.py` (connect-time scope
+resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
+`_serialize_for_client`, `SlotOrigin`), `dashboard/token_auth.py`
+(`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`), `apps/manifest.py`
+(`_granted_list`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+for developer-facing diagnostics, drift-guarded by
+`website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
+authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).

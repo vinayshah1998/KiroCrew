@@ -12,8 +12,15 @@ from aiohttp import WSMsgType, web
 
 from kiro_crew import __version__ as _local_version
 from kiro_crew import shutdown_event
+from kiro_crew.apps.manager import get_app_manifest
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.ws_event_scope import (
+    _audit_deny,
+    build_allowed_event_set,
+    filter_slots_for_app,
+    slots_envelope_extras,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -143,14 +150,57 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
 
     state.register_ws(ws, owner=owner_request)
 
+    # Store app identity on the WS connection so the broadcast chokepoint can
+    # filter. ``_is_dashboard_user`` comes from a POSITIVE signal produced by
+    # the auth middleware (``request["is_dashboard_user"]``) — it is never
+    # inferred from the absence of ``_app`` here. If a refactor reaches
+    # ``api_ws`` without passing through that middleware, the flag defaults to
+    # False and ``_send_ws_all`` keeps its deny-by-default behaviour.
+    ws_app: str = request.get("app", "")
+    ws["_app"] = ws_app
+    ws["_is_dashboard_user"] = request.get("is_dashboard_user", False)
+    allowed_events: frozenset[str] = frozenset()
+    if ws_app:
+        try:
+            # ``get_app_manifest`` stats + reads + JSON-parses the file with no
+            # internal cache, so it is offloaded: this runs on the event loop
+            # for EVERY app WS connect (and reconnect storms are the norm after
+            # a gateway restart), and on slow or contended storage a blocking
+            # read here stalls every other request and the heartbeat with it.
+            manifest = await asyncio.to_thread(get_app_manifest, ws_app)
+            events_declared = manifest.permissions.events if manifest else []
+        except Exception:
+            events_declared = []
+        allowed_events = build_allowed_event_set(events_declared)
+    ws["_allowed_events"] = allowed_events
+
     # Push current slots immediately so sidebar populates without waiting.
+    # App tokens get only the slots their manifest scope allows.
     try:
-        slots_data = state.serialize_slots(include_check_status=owner_request)
+        all_slots = state.serialize_slots(include_check_status=owner_request)
+        if ws.get("_is_dashboard_user", False):
+            slots_data = all_slots
+        elif ws_app:
+            slots_data = filter_slots_for_app(all_slots, ws_app, allowed_events, state)
+        else:
+            # Unknown identity (neither flag nor app) — deny by default.
+            slots_data = []
+        # ``yolo`` is the live blanket-approval override, i.e. operator security
+        # posture rather than slot data, so an app token sees it only with the
+        # scope that already gates ``yolo_expired``. Dashboard users always do.
+        # Same decision as the broadcast re-push in
+        # ``DashboardState._serialize_for_client`` — routed through the gate's
+        # helper so the two cannot drift.
+        envelope_extras: dict[str, object] = (
+            {"yolo": state._yolo}
+            if ws.get("_is_dashboard_user", False)
+            else dict(slots_envelope_extras(allowed_events, yolo=state._yolo))
+        )
         await ws.send_json(
             {
                 "type": "slots",
                 "data": slots_data,
-                "yolo": state._yolo,
+                **envelope_extras,
                 # Seed the client's generation baseline so a later change is
                 # detectable as a change rather than as a first sighting.
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
@@ -259,6 +309,31 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     data = json.loads(msg.data)
                     msg_type = data.get("type", "")
                     if msg_type == "subscribe_logs":
+                        # The gateway log stream is privileged. The broadcast
+                        # chokepoint filters future ``log`` events, but the
+                        # ring-buffer replay below bypasses it — gate at the
+                        # source. Positive-flag check (CWE-269): a falsy
+                        # ``_app`` alone must not open this.
+                        # Accept `log:all` as well. The per-event chokepoint
+                        # takes `<decl>` OR `<decl>:all`, so declaring
+                        # `log:all` let LIVE log events through while this
+                        # replay gate -- checking only the bare form -- refused
+                        # the buffered history: same declaration, two answers.
+                        if not ws.get("_is_dashboard_user", False) and not (
+                            "log" in allowed_events or "log:all" in allowed_events
+                        ):
+                            try:
+                                _audit_deny(
+                                    ws_app or "<unknown>",
+                                    "subscribe_logs",
+                                    "log_scope_not_declared",
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "ws: SEL audit for subscribe_logs deny failed",
+                                    exc_info=True,
+                                )
+                            continue
                         state.subscribe_logs(ws)
                         # Replay log ring buffer
                         for entry in list(_log_ring):
@@ -270,6 +345,17 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     elif msg_type == "unsubscribe_logs":
                         state.unsubscribe_logs(ws)
                     elif msg_type == "subscribe_subagents":
+                        # No declaration-level gate here on purpose. Owning
+                        # your own slots is the DEFAULT, not something a
+                        # manifest opts into, so refusing the subscription when
+                        # nothing matched ``subagent*``/``slots:*`` starved an
+                        # app of its OWN slot's replay — the one thing it is
+                        # always entitled to. Every replay frame below still
+                        # goes through the per-frame gate, which is where the
+                        # scope decision belongs; a subscription that is
+                        # allowed to exist but yields nothing visible is the
+                        # correct shape for an app that declared no extra
+                        # scope.
                         state.subscribe_subagents(ws)
 
                         def _r(t: str) -> str:
@@ -375,8 +461,28 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     )
                                 except Exception:
                                     pass
+                        # Per-slot scope gate on the reconnect replay. The
+                        # broadcast chokepoint covers live events, but this
+                        # replay writes to the socket directly, so it must
+                        # apply the same check. Dashboard users pass through
+                        # ``_ws_client_allowed`` unconditionally.
+                        _replay = [
+                            _f
+                            for _f in _replay
+                            if state._ws_client_allowed(
+                                ws, str(_f.get("type", "")), _f.get("data", {})
+                            )
+                        ]
                         try:
                             if len(_replay) > SUBAGENT_REPLAY_BATCH_THRESHOLD:
+                                # ``subagent_snapshot_batch`` is deliberately
+                                # absent from every ws_event_scope table: it is
+                                # delivery packaging for frames THIS socket is
+                                # already cleared for (filtered item-by-item
+                                # above), never a broadcast. Routing it through
+                                # the gate would reject it as an unknown event
+                                # and cost the app its whole replay, so keep
+                                # this send and the per-item filter together.
                                 await ws.send_json(
                                     {"type": "subagent_snapshot_batch", "data": {"items": _replay}}
                                 )
