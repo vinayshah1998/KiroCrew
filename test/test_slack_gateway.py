@@ -4919,24 +4919,22 @@ class TestChannelTransportStartGate:
         import contextlib as _cl  # local import; keeps module import block untouched
 
         assert isinstance(stack, _cl.ExitStack)  # documents the contract
-        # slack.gateway imports the four maybe_start_* at module top (hoisted; no
-        # cycle), so patch the names bound IN the gateway module, not their source
-        # modules — patching the source would not affect the already-bound refs.
-        mocks = {}
-        mocks["wecom"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_wecom", new=AsyncMock())
-        )
-        mocks["telegram"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_telegram", new=AsyncMock())
-        )
-        mocks["discord"] = stack.enter_context(
-            patch(
-                "kiro_crew.slack.gateway.maybe_start_discord",
-                new=AsyncMock(return_value=discord_ret),
-            )
-        )
-        mocks["webex"] = stack.enter_context(
-            patch("kiro_crew.slack.gateway.maybe_start_webex", new=AsyncMock())
+        # The registry rewrite (PR ③) removed the module-level maybe_start_*
+        # bindings from slack.gateway — the roster now comes from
+        # kiro_crew.channels. Tests inject a descriptor tuple through
+        # _start_channel_transports(descriptors=...) instead of patching names;
+        # the mocks and every assertion below are unchanged.
+        from kiro_crew.messaging.registry import ChannelDescriptor
+
+        mocks = {
+            "wecom": AsyncMock(),
+            "telegram": AsyncMock(),
+            "discord": AsyncMock(return_value=discord_ret),
+            "webex": AsyncMock(),
+        }
+        self._descriptors = tuple(
+            ChannelDescriptor(channel_type=name, start=mock)
+            for name, mock in mocks.items()
         )
         return mocks
 
@@ -4964,7 +4962,7 @@ class TestChannelTransportStartGate:
         discord_client = MagicMock(name="discord_client")
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack, discord_ret=discord_client)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Denied members: maybe_start_* never invoked, clients stay None.
         mocks["wecom"].assert_not_awaited()
@@ -4988,7 +4986,7 @@ class TestChannelTransportStartGate:
         self._enable_all_transports(orch)
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         mocks["wecom"].assert_awaited_once()
         mocks["telegram"].assert_awaited_once()
@@ -5034,7 +5032,7 @@ class TestChannelTransportStartGate:
         discord_client = MagicMock(name="discord_client")
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack, discord_ret=discord_client)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Host profile narrows telegram out even though the policy allowed it.
         mocks["telegram"].assert_not_awaited()
@@ -5070,7 +5068,7 @@ class TestChannelTransportStartGate:
         monkeypatch.setattr(gw, "_channel_transport_permitted", _spy)
         with contextlib.ExitStack() as stack:
             mocks = self._patch_starts(stack)
-            await orch._start_channel_transports()
+            await orch._start_channel_transports(descriptors=self._descriptors)
 
         # Only the enabled transport was evaluated + started.
         assert queried == ["telegram"]

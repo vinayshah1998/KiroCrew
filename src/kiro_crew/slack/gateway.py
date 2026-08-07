@@ -54,6 +54,7 @@ from kiro_crew.autonudge import (
     is_channel_key,
 )
 from kiro_crew.channel_history import ChannelHistory
+from kiro_crew.channels import builtin_channel_descriptors
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CRED_DISCORD_BOT_TOKEN,
@@ -107,7 +108,6 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-from kiro_crew.discord.gateway import maybe_start_discord
 from kiro_crew.embeddings import (
     embedding_model_is_custom,
     get_shared_embedder,
@@ -151,6 +151,7 @@ from kiro_crew.mcp_gateway.rewriter import (
     rewrite_agents,
 )
 from kiro_crew.memory import MemoryStore
+from kiro_crew.messaging import registry
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.platform import boot_platform
@@ -194,15 +195,11 @@ from kiro_crew.subagent import (
     resolve_max_subagents,
 )
 from kiro_crew.taskrunner import TaskRunner
-from kiro_crew.teams.gateway import maybe_start_teams
-from kiro_crew.telegram.gateway import maybe_start_telegram
-from kiro_crew.webex.gateway import maybe_start_webex
-from kiro_crew.wecom.gateway import maybe_start_wecom
-from kiro_crew.weixin.gateway import maybe_start_weixin
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import _ChatSlot
     from kiro_crew.discord.client import DiscordClient
+    from kiro_crew.messaging.registry import ChannelDescriptor
     from kiro_crew.providers.base import LLMProvider
     from kiro_crew.subagent_scale import SubagentEventCoalescer
     from kiro_crew.task_models import Task
@@ -943,6 +940,11 @@ class GatewayOrchestrator:
         self._pending_queue: dict[str, list] = {}
         self._socket_client: WSSocketModeClient | None = None
         self._wecom_client: "WeComClient | None" = None  # set by maybe_start_wecom
+        # Registry-owned live channel handles ({channel_type: client}). The
+        # per-channel _<type>_client attributes are legacy mirrors kept in sync
+        # by messaging.registry.start_channels until the config-schema PR
+        # retires them; shutdown closes through THIS dict.
+        self._channel_handles: dict[str, object] = {}
         self._model_download_task: "asyncio.Task[bool] | None" = None
         self._auto_migrate_task: "asyncio.Task[None] | None" = None
         # Boot-time update check, started fire-and-forget after the signal
@@ -5348,18 +5350,7 @@ class GatewayOrchestrator:
             cleanup_tasks.append(self._dashboard_runner.cleanup())
         if self._socket_client:
             cleanup_tasks.append(asyncio.wait_for(self._socket_client.close(), timeout=1.0))
-        if self._wecom_client:
-            cleanup_tasks.append(asyncio.wait_for(self._wecom_client.close(), timeout=2.0))
-        if self._telegram_client:
-            cleanup_tasks.append(asyncio.wait_for(self._telegram_client.close(), timeout=2.0))
-        if self._weixin_client:
-            cleanup_tasks.append(asyncio.wait_for(self._weixin_client.close(), timeout=2.0))
-        if self._discord_client:
-            cleanup_tasks.append(asyncio.wait_for(self._discord_client.close(), timeout=2.0))
-        if self._webex_client:
-            cleanup_tasks.append(asyncio.wait_for(self._webex_client.close(), timeout=2.0))
-        if self._teams_client:
-            cleanup_tasks.append(asyncio.wait_for(self._teams_client.close(), timeout=2.0))
+        cleanup_tasks.extend(registry.shutdown_tasks(self._channel_handles, timeout=2.0))
         # Cancel background model download if still in flight
         if self._model_download_task is not None and not self._model_download_task.done():
             self._model_download_task.cancel()
@@ -6059,32 +6050,39 @@ class GatewayOrchestrator:
         cleanup_orphaned_sessions()
         os._exit(0)
 
-    async def _start_channel_transports(self) -> None:
+    async def _start_channel_transports(
+        self, descriptors: "tuple[ChannelDescriptor, ...] | None" = None
+    ) -> None:
         """Start each non-Slack transport, gated on the ``channels`` scope.
+
+        Registry-driven (PR ③ of the channel-plugin RFC): the roster comes from
+        :func:`kiro_crew.channels.builtin_channel_descriptors` and the loop
+        lives in :mod:`kiro_crew.messaging.registry` — adding a channel no
+        longer edits this method. ``descriptors`` is injectable for tests.
 
         Every transport is a guarded no-op unless enabled + credentialed (its
         own ``maybe_start_*``), and is ADDITIONALLY gated on the ``channels``
         governance scope: a policy that denies the transport member keeps it from
-        connecting at all, and its client stays ``None``. The scope + member ids
-        (``wecom``/``telegram``/``discord``/``webex``) are IDENTICAL to the
-        outbound chokepoints — outbound-send (``mcp_core``) and outbound
-        cross-surface mirroring (``chat_runner``) — so one ``channels`` allowlist
-        governs a transport at connect time and on every outbound path (this gate
-        is the connect-time member; inbound receive is gated per-message by
+        connecting at all, and its client stays ``None``. The member ids are
+        IDENTICAL to the outbound chokepoints — outbound-send (``mcp_core``) and
+        outbound cross-surface mirroring (``chat_runner``) — so one ``channels``
+        allowlist governs a transport at connect time and on every outbound path
+        (inbound receive is gated per-message by
         ``messaging.identity.channel_inbound_permitted``).
 
         Default-build invariant: with no policy governing ``channels`` (the
         standard OSS build) the gate permits, so every transport starts exactly
-        as before — byte-identical behavior. Slack is gated too, but in
-        ``_connect_slack`` rather than here, because it owns its own socket-client
-        lifecycle (a deny must drop that client, not just skip a start call).
+        as before — byte-identical behavior. Slack is a registry member too
+        (``start=None``) but is gated in ``_connect_slack`` rather than here,
+        because it owns its own socket-client lifecycle (a deny must drop that
+        client, not just skip a start call).
 
         Loop hygiene: ``_channel_transport_permitted`` reaches
         ``ProfileStore._ensure_fresh``, which stats/reads the profile files off
         disk — blocking I/O. This method runs on the gateway event loop (inside
         ``run()``), so the governance decisions are computed together in an
-        executor BEFORE any transport is started; only the actual
-        ``await maybe_start_*`` stays on the loop.
+        executor BEFORE any transport is started; only the actual factory
+        awaits stay on the loop.
 
         Enabled-only eval: the gate is queried ONLY for a transport whose
         ``_<member>_enabled`` is set (config-enabled + credentialed). A transport
@@ -6094,38 +6092,22 @@ class GatewayOrchestrator:
         the no-policy default is unchanged: every ENABLED transport still resolves
         to permit and starts exactly as before.
         """
-        # Evaluate each channel-start decision OFF the loop (each does blocking
-        # profile-file I/O), but ONLY for config-enabled transports — a disabled
-        # transport never starts, so skip it to avoid a deny-SEL for a channel
-        # that would no-op anyway. Members not evaluated stay not-permitted.
-        members = ("wecom", "telegram", "discord", "webex", "teams", "weixin")
-        enabled = {m: bool(getattr(self, f"_{m}_enabled", False)) for m in members}
+        if descriptors is None:
+            descriptors = builtin_channel_descriptors()
+        boot = registry.bootable(descriptors)
+        enabled = {
+            d.channel_type: bool(getattr(self, f"_{d.channel_type}_enabled", False))
+            for d in boot
+        }
         loop = asyncio.get_running_loop()
         permitted = await loop.run_in_executor(
             maintenance_executor(),
             lambda: {
-                m: (_channel_transport_permitted(m) if enabled[m] else False) for m in members
+                m: (_channel_transport_permitted(m) if enabled[m] else False)
+                for m in enabled
             },
         )
-        # WeChat (WeCom AI-bot) channel — guarded no-op unless enabled + credentialed.
-        if permitted["wecom"]:
-            self._wecom_client = await maybe_start_wecom(self)
-        # Telegram channel — guarded no-op unless enabled + token present.
-        if permitted["telegram"]:
-            self._telegram_client = await maybe_start_telegram(self)
-        # Discord channel — guarded no-op unless enabled + token present.
-        if permitted["discord"]:
-            self._discord_client = await maybe_start_discord(self)
-        # Webex channel — guarded no-op unless enabled + token present.
-        if permitted["webex"]:
-            self._webex_client = await maybe_start_webex(self)
-        # Teams channel — guarded no-op unless enabled + App ID/password present.
-        if permitted["teams"]:
-            self._teams_client = await maybe_start_teams(self)
-        # WeChat (personal Weixin over iLink) channel — guarded no-op unless
-        # enabled + credentialed. Distinct member from "wecom" (enterprise).
-        if permitted["weixin"]:
-            self._weixin_client = await maybe_start_weixin(self)
+        self._channel_handles = await registry.start_channels(self, descriptors, permitted)
 
 
 async def run_gateway(

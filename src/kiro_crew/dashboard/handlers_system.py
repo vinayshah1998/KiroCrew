@@ -682,31 +682,15 @@ async def api_compliance_yolo_status(request: web.Request) -> web.Response:
 
 def _channel_members() -> tuple[str, ...]:
     """Canonical ``channel_type`` ids for the messaging channels, derived from
-    each transport's ``channel_type`` class attribute — the single source of
-    truth — so this list can never drift from the transports themselves.
-    Imported here (off the event loop, inside the executor worker) so the
-    transport modules' own imports don't run on the aiohttp loop.
+    the builtin channel registry — the single source of truth — so this list
+    can never drift from the channels themselves. Imported here (off the event
+    loop, inside the executor worker) so the channel modules' own imports don't
+    run on the aiohttp loop; the roster is cached after the first call.
     """
-    from kiro_crew.discord.transport import DiscordTransport
-    from kiro_crew.slack.transport import SlackTransport
-    from kiro_crew.teams.transport import TeamsTransport
-    from kiro_crew.telegram.transport import TelegramTransport
-    from kiro_crew.webex.transport import WebexTransport
-    from kiro_crew.wecom.transport import WeComTransport
-    from kiro_crew.weixin.transport import WeixinTransport
+    from kiro_crew.channels import builtin_channel_descriptors
+    from kiro_crew.messaging.registry import governed_members
 
-    return tuple(
-        t.channel_type
-        for t in (
-            SlackTransport,
-            DiscordTransport,
-            TelegramTransport,
-            WebexTransport,
-            WeComTransport,
-            TeamsTransport,
-            WeixinTransport,
-        )
-    )
+    return governed_members(builtin_channel_descriptors())
 
 
 def _collect_channel_governance() -> dict[str, object]:
