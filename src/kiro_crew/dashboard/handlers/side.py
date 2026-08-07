@@ -12,15 +12,17 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from aiohttp import web
 
 from kiro_crew.acp.client import AcpAuthRequired
 from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.dashboard.side_context import build_side_message
-from kiro_crew.dashboard.side_state import SideState
+from kiro_crew.dashboard.side_state import MAX_SIDE_QUEUE, SideState
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.dashboard.ws import broadcast_side_result
+from kiro_crew.dashboard.steer_settle import settle_consumed_steers
+from kiro_crew.dashboard.ws import broadcast_side_queue, broadcast_side_result
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
@@ -43,6 +45,182 @@ def _side_session_key(slot_key: str) -> str:
     return f"side:{slot_key}"
 
 
+def _dispatch_side_turn(state: DashboardState, slot, question: str) -> str:
+    """Start a side turn for *question* and return its run_id.
+
+    Callers must have established that no side turn is in flight; there is no
+    await between the caller's check and the state mutation here, so the
+    single-threaded event loop makes the pair atomic.
+    """
+    side = slot._side
+    run_id = uuid.uuid4().hex
+    is_first_turn = not any(m.get("role") == "assistant" for m in side.messages)
+    side.last_run_id = run_id
+    side.is_complete = False
+    side.append_user(question)
+
+    broadcast_side_result(
+        state,
+        slot_key=slot.key,
+        run_id=run_id,
+        role="user",
+        content=question,
+    )
+
+    task = asyncio.create_task(
+        _run_side_turn(
+            state,
+            slot,
+            run_id,
+            question,
+            is_first_turn=is_first_turn,
+        )
+    )
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+    return run_id
+
+
+def _requeue_unconsumed_side_steers(
+    state: DashboardState, slot, run_id: str, side_at_start: Any = None
+) -> None:
+    """Degrade steers the backend never confirmed into visible queue cards.
+
+    A steer is a fire-and-forget write, so ``steer()`` returning True only proves
+    the bytes left; the ``steering_consumed`` echo is the authoritative signal.
+    Anything still pending when the turn ends reached no generation and would
+    otherwise vanish having been reported as delivered.
+
+    Requeued at the HEAD, preserving relative order — a steer was meant to be
+    injected before anything the user queued after it. Each becomes an ordinary
+    card, so a user who no longer wants it cancels it with one click.
+
+    Gated on ``side_at_start`` identity as well as ``run_id``: the run id alone
+    would let a superseded turn write onto a sidecar a close+reopen replaced.
+    """
+    side = slot._side
+    if side is None or not side.open or side.last_run_id != run_id:
+        return
+    if side_at_start is not None and side is not side_at_start:
+        return
+    if not side.pending_steers:
+        return
+    orphaned = side.pending_steers[:]
+    side.pending_steers.clear()
+    for message in reversed(orphaned):
+        qid = side.queue_insert_front(message)
+        broadcast_side_queue(
+            state,
+            slot_key=slot.key,
+            action="push",
+            queue_id=qid,
+            content=message,
+            depth=len(side.queue),
+        )
+    logger.info(
+        "Requeued %d unconsumed side steer(s): slot=%s run_id=%s",
+        len(orphaned),
+        slot.key,
+        run_id,
+    )
+
+
+def _drain_side_queue(state: DashboardState, slot, run_id: str) -> None:
+    """Promote the oldest queued message to the next side turn.
+
+    ``run_id`` is identity-checked against the sidecar's current run so a stale
+    task from a closed-and-reopened side can never dispatch onto the new state.
+    No-op when the side is closed, still busy, or the queue is empty.
+    """
+    side = slot._side
+    if side is None or not side.open:
+        return
+    if side.last_run_id != run_id or not side.is_complete:
+        return
+    entry = side.queue_pop()
+    if entry is None:
+        return
+    broadcast_side_queue(
+        state,
+        slot_key=slot.key,
+        action="drain",
+        queue_id=entry["id"],
+        depth=len(side.queue),
+    )
+    try:
+        _dispatch_side_turn(state, slot, entry["content"])
+    except Exception:
+        # The card is already retired on the client, so put the text back at the
+        # head rather than only reporting the failure: "a submit is never
+        # dropped" has to hold on this path too.
+        logger.exception("Side queue drain failed: slot=%s", slot.key)
+        qid = side.queue_insert_front(entry["content"])
+        broadcast_side_queue(
+            state,
+            slot_key=slot.key,
+            action="push",
+            queue_id=qid,
+            content=entry["content"],
+            depth=len(side.queue),
+        )
+        broadcast_side_result(
+            state,
+            slot_key=slot.key,
+            run_id=entry["id"],
+            role="assistant",
+            content="(queued side question could not be started — it is back in the queue)",
+            is_error=True,
+            final=True,
+        )
+
+
+async def _try_side_steer(state: DashboardState, slot, question: str) -> bool:
+    """Inject *question* into the side turn already streaming on this slot.
+
+    Returns False (never raises) when the isolated session is gone, the backend
+    has no steer support, or no turn is genuinely live — every one of which must
+    fall through to the queue rather than drop the user's text.
+
+    Registers the question as an unproven delivery on ``pending_steers`` BEFORE
+    the RPC suspends. ``steer()`` returning True only proves the bytes left; the
+    ``steering_consumed`` echo is what proves injection. Registering first is
+    what makes the ordering safe: if the turn's ``finally`` runs while this is
+    suspended, it already sees the entry and requeues it. Appending afterwards
+    would land on an idle sidecar and orphan the question.
+    """
+    provider = state.sessions.get_provider(_side_session_key(slot.key))
+    if provider is None or not getattr(provider, "supports_steer", False):
+        return False
+    steer = getattr(provider, "steer", None)
+    if steer is None:
+        return False
+    # ``has_active_turn`` gates on a GENUINELY live prompt: the provider stays
+    # registered through post-turn bookkeeping, and kiro-cli silently swallows a
+    # steer for a prompt that already ended. Absent the probe, attempt the steer
+    # and let its boolean decide.
+    has_active = getattr(provider, "has_active_turn", None)
+    if has_active is not None and not has_active():
+        return False
+    side = slot._side
+    if side is None:
+        return False
+    side.pending_steers.append(question)
+    try:
+        delivered = bool(await steer(question))
+    except Exception as exc:
+        logger.warning("Side steer failed for slot %s: %s", slot.key, exc)
+        delivered = False
+    if not delivered:
+        # Unwind so the queue fallback cannot double-deliver. If the entry is
+        # already gone the turn's finally requeued it during the await — either
+        # way it is accounted for, so report success to skip the fallback.
+        try:
+            side.pending_steers.remove(question)
+        except ValueError:
+            return True
+    return delivered
+
+
 async def _run_side_turn(
     state: DashboardState,
     slot,
@@ -53,6 +231,10 @@ async def _run_side_turn(
 ) -> None:
     """Background task: drive one side turn and broadcast chunks over WS."""
     side_key = _side_session_key(slot.key)
+    # The sidecar this turn belongs to. Every later mutation is gated on the slot
+    # still pointing at THIS object, so a close+reopen part-way through can never
+    # have the old turn settle or requeue onto the replacement's state.
+    side_at_start = slot._side
     message = build_side_message(slot, question, is_first_turn=is_first_turn)
     chunks: list[str] = []
     # Rolling-buffer redactor for the live side stream. broadcast_side_result
@@ -73,6 +255,25 @@ async def _run_side_turn(
                 role="assistant",
                 content=safe,
             )
+
+    def _on_steer_consumed(snapshot: str) -> None:
+        """Settle the steers this echo proves the backend injected.
+
+        Bound to ``side_at_start``: an echo belongs to the turn that produced it,
+        so a close+reopen mid-turn must not let it settle the REPLACEMENT
+        sidecar's own pending steer — that steer would then never be requeued and
+        the question would be lost silently.
+
+        Whatever stays pending never reached a generation, and the finally below
+        turns it back into a visible queue card.
+        """
+        if side_at_start is None or slot._side is not side_at_start:
+            return
+        if not side_at_start.pending_steers:
+            return
+        side_at_start.pending_steers[:] = settle_consumed_steers(
+            side_at_start.pending_steers, snapshot
+        )
 
     provider = None
     acquired_key = ""
@@ -108,6 +309,7 @@ async def _run_side_turn(
                 message,
                 approval_policy=ToolApprovalPolicy.REJECT_ALL,
                 on_chunk=_on_chunk,
+                on_steer_consumed=_on_steer_consumed,
             )
             # Redact the assembled text before it is stored/broadcast as the
             # terminal frame (which replaces the streamed deltas). Never trust
@@ -212,6 +414,10 @@ async def _run_side_turn(
                     acquired_key,
                     exc_info=True,
                 )
+        # Release first, then drain: the next turn re-acquires the same isolated
+        # session, so dispatching before the release would leave it held twice.
+        _requeue_unconsumed_side_steers(state, slot, run_id, side_at_start)
+        _drain_side_queue(state, slot, run_id)
 
 
 def _check_slot_ownership(
@@ -296,10 +502,15 @@ async def api_side_open(request: web.Request) -> web.Response:
 
 
 async def api_side_turn(request: web.Request) -> web.Response:
-    """POST /api/chat/slots/{slot}/side/turn — body ``{"question": str}``.
+    """POST /api/chat/slots/{slot}/side/turn — body ``{"question": str, "steer"?: bool}``.
 
-    Returns ``{ok, run_id}`` immediately and drives the LLM stream in a
-    background task; chunks are broadcast on ``chat.side_result``.
+    Three outcomes, all returning immediately:
+
+    - idle → starts a turn, ``{ok, run_id}``; the stream runs as a background
+      task and chunks are broadcast on ``chat.side_result``.
+    - in flight + ``steer`` → injects into the RUNNING turn, ``{ok, steered}``.
+    - in flight (or a steer that could not be delivered) → queues behind the
+      turn, ``{ok, queued, queue_id, depth}``.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -350,50 +561,136 @@ async def api_side_turn(request: web.Request) -> web.Response:
         )
 
     if slot._side.last_run_id and not slot._side.is_complete:
+        # A turn is in flight. Mirror the main chat: steer injects into the
+        # RUNNING turn, queue defers it to the next one, and an unavailable
+        # steer falls through to the queue so the text is NEVER dropped.
+        #
+        # Bind the commit to the sidecar OBJECT and run the steer was aimed at,
+        # captured before the RPC suspends. Re-reading them afterwards would
+        # attribute a steer to whatever is live now: a close+reopen swaps in a
+        # fresh SideState that is also ``open``, and a completed turn's drain can
+        # already have started the next run.
+        side_before = slot._side
+        run_before = side_before.last_run_id
+        if body.get("steer"):
+            delivered = await _try_side_steer(state, slot, question)
+            # Identity is checked on BOTH outcomes: a close+reopen during the RPC
+            # leaves ``slot._side`` pointing at a fresh, also-``open`` sidecar, and
+            # queueing this question onto it would put it in a side conversation
+            # that never asked for it.
+            if slot._side is not side_before or not side_before.open:
+                return web.json_response(
+                    {
+                        "error": "side conversation is not open",
+                        "code": "side_not_open",
+                    },
+                    status=409,
+                )
+            if delivered:
+                side_after = side_before
+                if side_after.last_run_id == run_before and not side_after.is_complete:
+                    side_after.append_user(question, steer=True)
+                    broadcast_side_result(
+                        state,
+                        slot_key=slot.key,
+                        run_id=run_before,
+                        role="user",
+                        content=question,
+                        steer=True,
+                    )
+                    sel().log_api_access(
+                        caller=request.get("app", "") or "dashboard",
+                        operation="chat.side_turn",
+                        outcome="allowed",
+                        source="dashboard",
+                        resources=(
+                            f"slot={slot.key},run_id={run_before},"
+                            f"mode=steer,question_len={len(question)}"
+                        ),
+                    )
+                    return web.json_response(
+                        {"ok": True, "steered": True, "run_id": run_before}
+                    )
+                # The turn ended (or was superseded) while the RPC was in flight, so
+                # the steer reached no live generation. Exactly one owner may place
+                # the text: claim the pending entry to take it, or report the card
+                # the turn's finally already made from it.
+                try:
+                    side_after.pending_steers.remove(question)
+                except ValueError:
+                    return web.json_response(
+                        {
+                            "ok": True,
+                            "queued": True,
+                            "demoted": True,
+                            "depth": len(side_after.queue),
+                        }
+                    )
+                # Claimed — fall through to the queue below.
+
+        side = slot._side
+        if side is None or not side.open:
+            return web.json_response(
+                {"error": "side conversation is not open", "code": "side_not_open"},
+                status=409,
+            )
+        qid = side.queue_append(question)
+        if qid is None:
+            sel().log_api_access(
+                caller=request.get("app", "") or "dashboard",
+                operation="chat.side_turn",
+                outcome="denied",
+                source="dashboard",
+                resources=f"slot={slot.key},depth={len(side.queue)}",
+                error="side queue full",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        f"side queue is full (max {MAX_SIDE_QUEUE}) — "
+                        "wait for the current turn or cancel a queued message"
+                    ),
+                    "code": "side_queue_full",
+                    "depth": len(side.queue),
+                },
+                status=429,
+            )
+        broadcast_side_queue(
+            state,
+            slot_key=slot.key,
+            action="push",
+            queue_id=qid,
+            content=question,
+            depth=len(side.queue),
+        )
         sel().log_api_access(
             caller=request.get("app", "") or "dashboard",
             operation="chat.side_turn",
-            outcome="denied",
+            outcome="allowed",
             source="dashboard",
-            resources=(f"slot={slot.key}," f"in_flight_run_id={slot._side.last_run_id}"),
-            error="side turn already in flight",
+            resources=(
+                f"slot={slot.key},mode=queue,queue_id={qid},"
+                f"depth={len(side.queue)},question_len={len(question)}"
+            ),
         )
+        # The turn may have finished during the steer attempt above. The drain
+        # hook only runs inside a turn's finally, so an entry queued after that
+        # point would sit forever — kick the drain here.
+        if side.is_complete:
+            _drain_side_queue(state, slot, side.last_run_id)
         return web.json_response(
             {
-                "error": (
-                    "a side turn is already in flight on this slot — "
-                    "wait for it to complete before submitting another"
-                ),
-                "in_flight_run_id": slot._side.last_run_id,
-            },
-            status=409,
+                "ok": True,
+                "queued": True,
+                "queue_id": qid,
+                "depth": len(side.queue),
+                # Tell a user who pressed "Steer" that the turn ended under them,
+                # so the queue card is not the only hint that the mode changed.
+                **({"demoted": True} if body.get("steer") else {}),
+            }
         )
 
-    run_id = uuid.uuid4().hex
-    is_first_turn = not any(m.get("role") == "assistant" for m in slot._side.messages)
-    slot._side.last_run_id = run_id
-    slot._side.is_complete = False
-    slot._side.append_user(question)
-
-    broadcast_side_result(
-        state,
-        slot_key=slot.key,
-        run_id=run_id,
-        role="user",
-        content=question,
-    )
-
-    task = asyncio.create_task(
-        _run_side_turn(
-            state,
-            slot,
-            run_id,
-            question,
-            is_first_turn=is_first_turn,
-        )
-    )
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+    run_id = _dispatch_side_turn(state, slot, question)
 
     sel().log_api_access(
         caller=request.get("app", "") or "dashboard",
@@ -413,6 +710,151 @@ async def api_side_turn(request: web.Request) -> web.Response:
             "messages": len(slot._side.messages),
         }
     )
+
+
+async def _read_side_queue_body(request: web.Request) -> str | web.Response:
+    """Parse ``{"content": str}`` from a side-queue edit. Returns the trimmed
+    content, or the error response to send."""
+    if not request.body_exists:
+        return web.json_response(
+            {"error": "missing JSON body", "code": "missing_body"}, status=400
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"error": "invalid JSON body", "code": "invalid_body"}, status=400
+        )
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_body"},
+            status=400,
+        )
+    content = body.get("content")
+    if not isinstance(content, str):
+        return web.json_response(
+            {"error": "content must be a string", "code": "invalid_content"},
+            status=400,
+        )
+    content = content.strip()
+    if not content:
+        return web.json_response(
+            {"error": "content must not be empty", "code": "empty_content"},
+            status=400,
+        )
+    if len(content.encode("utf-8")) > _MAX_QUESTION_BYTES:
+        return web.json_response(
+            {
+                "error": f"content too long (max {_MAX_QUESTION_BYTES} bytes)",
+                "code": "content_too_long",
+            },
+            status=400,
+        )
+    return content
+
+
+def _resolve_side_queue_slot(
+    request: web.Request, operation: str
+) -> tuple[Any, web.Response | None]:
+    """Shared lookup for the side-queue mutation endpoints.
+
+    Returns ``(slot, None)`` on success or ``(None, response)`` to send.
+    """
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if not slot:
+        return None, web.json_response(
+            {"error": "not found", "code": "slot_not_found"}, status=404
+        )
+    own = _check_slot_ownership(request, slot, operation)
+    if own is not None:
+        return None, own
+    if slot._side is None or not slot._side.open:
+        return None, web.json_response(
+            {"error": "side conversation is not open", "code": "side_not_open"},
+            status=409,
+        )
+    return slot, None
+
+
+async def api_side_queue_cancel(request: web.Request) -> web.Response:
+    """DELETE /api/chat/slots/{slot}/side/queue/{queue_id} — drop one entry.
+
+    The frontend moves the cancelled text back into its composer, so the content
+    is echoed back (redacted) rather than discarded silently.
+    """
+    state: DashboardState = request.app["state"]
+    slot, err = _resolve_side_queue_slot(request, "chat.side_queue_cancel")
+    if err is not None:
+        return err
+    queue_id = request.match_info["queue_id"]
+    content = slot._side.queue_remove(queue_id)
+    if content is None:
+        return web.json_response(
+            {"error": "queue entry not found", "code": "queue_entry_not_found"},
+            status=404,
+        )
+    broadcast_side_queue(
+        state,
+        slot_key=slot.key,
+        action="cancel",
+        queue_id=queue_id,
+        content=content,
+        depth=len(slot._side.queue),
+    )
+    sel().log_api_access(
+        caller=request.get("app", "") or "dashboard",
+        operation="chat.side_queue_cancel",
+        outcome="allowed",
+        source="dashboard",
+        resources=f"slot={slot.key},queue_id={queue_id},depth={len(slot._side.queue)}",
+    )
+    return web.json_response(
+        {"ok": True, "content": redact(content), "depth": len(slot._side.queue)}
+    )
+
+
+async def api_side_queue_edit(request: web.Request) -> web.Response:
+    """PATCH /api/chat/slots/{slot}/side/queue/{queue_id} — body ``{"content"}``.
+
+    Rewrites one queued entry in place; queue order is preserved.
+    """
+    state: DashboardState = request.app["state"]
+    slot, err = _resolve_side_queue_slot(request, "chat.side_queue_edit")
+    if err is not None:
+        return err
+    parsed = await _read_side_queue_body(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    # Re-read after the body await: a close (or a drain) may have landed.
+    side = slot._side
+    if side is None or not side.open:
+        return web.json_response(
+            {"error": "side conversation is not open", "code": "side_not_open"},
+            status=409,
+        )
+    queue_id = request.match_info["queue_id"]
+    if not side.queue_edit(queue_id, parsed):
+        return web.json_response(
+            {"error": "queue entry not found", "code": "queue_entry_not_found"},
+            status=404,
+        )
+    broadcast_side_queue(
+        state,
+        slot_key=slot.key,
+        action="edit",
+        queue_id=queue_id,
+        content=parsed,
+        depth=len(side.queue),
+    )
+    sel().log_api_access(
+        caller=request.get("app", "") or "dashboard",
+        operation="chat.side_queue_edit",
+        outcome="allowed",
+        source="dashboard",
+        resources=f"slot={slot.key},queue_id={queue_id},content_len={len(parsed)}",
+    )
+    return web.json_response({"ok": True, "depth": len(side.queue)})
 
 
 async def api_side_close(request: web.Request) -> web.Response:

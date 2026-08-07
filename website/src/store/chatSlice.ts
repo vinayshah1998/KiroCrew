@@ -269,6 +269,15 @@ export interface SideMessage {
   ts: string
   run_id?: string
   is_error?: boolean
+  /** Injected into a turn that was already running, not asked from idle. */
+  steer?: boolean
+}
+
+/** One side question held behind an in-flight side turn. */
+export interface SideQueueEntry {
+  id: string
+  content: string
+  ts: string
 }
 
 export interface SideState {
@@ -276,6 +285,8 @@ export interface SideState {
   lastRunId?: string
   pending?: boolean
   streaming?: boolean
+  /** Questions queued behind the running turn, oldest first. */
+  queue?: SideQueueEntry[]
   openedAtTurnCount: number
   createdAt: string
 }
@@ -1862,8 +1873,8 @@ const chatSlice = createSlice({
         }
       }
     },
-    sseSideResult(state, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean }>) {
-      const { slot, run_id, role, content, ts, is_error, final } = action.payload
+    sseSideResult(state, action: PayloadAction<{ slot: string; run_id: string; role: 'user' | 'assistant'; content: string; ts?: number; is_error?: boolean; final?: boolean; steer?: boolean }>) {
+      const { slot, run_id, role, content, ts, is_error, final, steer } = action.payload
       if (isUnsafeKey(slot)) return
       const tsIso = typeof ts === 'number' ? new Date(ts * 1000).toISOString() : new Date().toISOString()
       // Intentional re-open (new user frame) clears the closed sentinel
@@ -1880,6 +1891,25 @@ const chatSlice = createSlice({
       }
       const side: SideState = state.slotSide[slot]
       if (role === 'user') {
+        if (steer) {
+          // A steer joins a turn whose answer is already streaming. Land the chip
+          // ABOVE that answer: the terminal frame replaces the whole assistant
+          // text, so it must still match the LAST row — pushing the user bubble
+          // after it would strand the reply and make the terminal frame append
+          // the full text a second time.
+          const entry: SideMessage = { role: 'user', content, ts: tsIso, run_id, steer: true }
+          const lastIdx = side.messages.length - 1
+          const tail = side.messages[lastIdx]
+          if (tail?.role === 'assistant' && tail.run_id === run_id) {
+            side.messages.splice(lastIdx, 0, entry)
+          } else {
+            side.messages.push(entry)
+          }
+          side.lastRunId = run_id
+          side.pending = true
+          side.streaming = true
+          return
+        }
         // Reconcile with optimistic bubble appended in sideOptimisticAppend.
         const lastUser = side.messages[side.messages.length - 1]
         if (lastUser?.role === 'user' && lastUser.content === content && !lastUser.run_id) {
@@ -1909,6 +1939,32 @@ const chatSlice = createSlice({
       }
       side.messages.push({ role: 'assistant', content, ts: tsIso, run_id })
       side.lastRunId = run_id
+    },
+    sseSideQueue(state, action: PayloadAction<{ slot: string; action: 'push' | 'edit' | 'cancel' | 'drain'; queue_id: string; content?: string; ts?: number }>) {
+      const { slot, action: kind, queue_id, content, ts } = action.payload
+      if (isUnsafeKey(slot)) return
+      // A queue mutation is never a reason to resurrect a closed side.
+      if (!state.slotSide[slot]) {
+        if (kind !== 'push' || state.slotSideClosed[slot]) return
+        const parentTurnCount = slot === state.activeSlot
+          ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
+          : 0
+        state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: new Date().toISOString() }
+      }
+      const side: SideState = state.slotSide[slot]
+      if (!side.queue) side.queue = []
+      const at = side.queue.findIndex(e => e.id === queue_id)
+      if (kind === 'push') {
+        const tsIso = typeof ts === 'number' ? new Date(ts * 1000).toISOString() : new Date().toISOString()
+        // Replay-safe: a redelivered push updates in place instead of doubling
+        // the card.
+        if (at >= 0) side.queue[at].content = content ?? side.queue[at].content
+        else side.queue.push({ id: queue_id, content: content ?? '', ts: tsIso })
+        return
+      }
+      if (at < 0) return
+      if (kind === 'edit') side.queue[at].content = content ?? side.queue[at].content
+      else side.queue.splice(at, 1)
     },
     sideClose(state, action: PayloadAction<string>) {
       delete state.slotSide[action.payload]
@@ -2742,6 +2798,6 @@ export const {
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun,
-  sseSideResult, sideClose, sideOptimisticAppend, sideOptimisticRollback,
+  sseSideResult, sseSideQueue, sideClose, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 export default chatSlice.reducer
