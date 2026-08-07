@@ -4,20 +4,33 @@ Thin auth layer for enterprise-authenticated website browsing via Playwright MCP
 
 ### Architecture
 
-```
-User clicks Globe → backend injects [BROWSE] → agent loads browser-auth skill
-  → kirocrew browse auth health / refresh
-  → Playwright MCP tools: browser_navigate, browser_click, browser_snapshot, etc.
+Browser Mode is a durable capability toggle in **Settings → Browser**, not a
+per-message chat control. When it is enabled the backend prepends the `[BROWSE]`
+marker to each chat message so the agent operates the browser; when it is off no
+marker is injected and the agent falls back to read-only `web_fetch`.
 
-Without Globe → agent uses ReadInternalWebsites (the internal MCP server)
 ```
+Browser Mode ON  → backend injects [BROWSE] on every message → agent operates
+  the browser → Playwright MCP tools: browser_navigate, browser_click,
+  browser_snapshot, etc.
+
+Browser Mode OFF → no [BROWSE] marker → agent uses read-only web_fetch instead
+```
+
+Browsing is default-on for every turn while Browser Mode is enabled. A client MAY
+send an explicit `browse: false` to suppress it for a single turn, but there is no
+standing per-session "Globe" toggle.
 
 ### Two Modes
 
+Two independent choices in **Settings → Browser** decide how a page opens: the
+transport (attach to your own browser vs. let Playwright launch its own) and, for
+the launch path, which engine Playwright launches.
+
 | Mode | Platform | How it works |
 |------|----------|--------------|
-| **Extension** | macOS (recommended) | Playwright attaches to user's running Chrome via extension. All existing auth (enterprise SSO session, Sentry, Kerberos) works automatically. |
-| **Headless** | Linux Cloud Desktops | Launches separate Chromium with `--auth-server-allowlist` + storage state cookie injection. |
+| **Extension (attach)** | macOS (recommended) | Playwright attaches to the user's running **Chromium-family** browser (Chrome, Edge, Brave, Arc, Opera) through the "Playwright MCP Bridge" extension. All existing auth (enterprise SSO session, Sentry, Kerberos) works automatically. Chromium-family only: Playwright ships no attach extension for Firefox or Safari, so those cannot be attached. |
+| **Launch (headless)** | Linux Cloud Desktops, macOS fallback | Playwright launches its **own** browser build. The launch engine is one of `chromium` / `firefox` / `webkit` (default `chromium`), selected in Settings and persisted in the `browser-engine` file. `firefox` and `webkit` are Playwright's own patched builds, not the user's installed Firefox/Safari, so they carry no user logins. Chromium adds `--auth-server-allowlist` + storage-state cookie injection. |
 
 ### Key Design Decisions
 
@@ -28,9 +41,21 @@ Playwright MCP handles all browser interaction. KiroCrew only handles enterprise
 - Extension mode: zero auth work — real Chrome session has everything
 - Headless mode: storage state (`~/.kiro/crew/playwright-storage-state.json`) + Kerberos via `--auth-server-allowlist`
 
-**Managed installation** — the Playwright MCP is auto-installed on gateway startup if missing.
+**Install on Browser-Mode enable.** Turning Browser Mode on from Settings runs a
+real install: `ensure_playwright_installed(engine)` in `browser/setup.py`
+bootstraps Node when absent (through the bundled `ensure-node.sh`), runs
+`npm install -g @playwright/mcp@latest`, then `playwright install <engine>` to
+fetch the OS/arch browser binary for the selected launch engine. It is
+best-effort and never raises: it returns a structured
+`{ok, step, detail, engine}` so the Browser settings save handler reports
+progress or an actionable failure in its JSON body instead of 500-ing. The npm
+and browser steps are skipped when a launcher already resolves, so re-enabling is
+fast.
 
-**Globe button triggers browse mode** — Backend injects `[BROWSE]` marker. Without it, agent uses `ReadInternalWebsites` (the internal MCP server) instead.
+**Browser Mode is a persistent capability toggle.** The durable
+`browser-mode-enabled` flag file under the data home is the gate. While it is on,
+the backend injects the `[BROWSE]` marker on every message. While it is off, the
+agent uses read-only `web_fetch` instead.
 
 ### Auth Flow (Headless Mode)
 
@@ -52,7 +77,9 @@ Playwright MCP handles all browser interaction. KiroCrew only handles enterprise
 |------|---------|
 | `~/.kiro/crew/playwright-config.json` | Playwright MCP config: `--auth-server-allowlist`, `storageState`, `isolated: true`, capabilities |
 | `~/.kiro/crew/playwright-storage-state.json` | Playwright storage state (generated from `~/.kiro/crew/browser-cookies.txt`) |
-| `~/.kiro/crew/playwright-extension-mode` | Flag file: extension mode enabled |
+| `~/.kiro/crew/browser-mode-enabled` | Flag file: Browser Mode enabled (durable capability toggle; presence = on) |
+| `~/.kiro/crew/browser-engine` | Selected launch engine (`chromium` / `firefox` / `webkit`); absent or unrecognized reads back as `chromium` |
+| `~/.kiro/crew/playwright-extension-mode` | Flag file: extension (attach) mode enabled |
 | `~/.kiro/crew/playwright-extension-token` | Chrome extension connection token (0o600 perms) |
 | `~/.kiro/settings/mcp.json` | MCP server config (args: `--extension` or `--config`) |
 
@@ -61,7 +88,7 @@ Playwright MCP handles all browser interaction. KiroCrew only handles enterprise
 | File | Purpose |
 |------|---------|
 | `browser/auth.py` | SSO cookies, federated SSO, KRB5CCNAME, health checks, URL validation |
-| `browser/setup.py` | Plugin-manager install, config generation, storage state refresh, MCP config patching |
+| `browser/setup.py` | Browser Mode + engine flags, `ensure_playwright_installed` (Node bootstrap + `@playwright/mcp` + `playwright install <engine>`), config generation, storage state refresh, MCP config patching |
 | `browser/cli.py` | `kirocrew browse` CLI: setup, auth health/refresh/inject/federate, extension on/off |
 | `mcp_playwright_proxy.py` | Stdio proxy: intercepts Playwright MCP responses, compresses accessibility trees |
 | `skills/browser-auth/SKILL.md` | Agent skill for auth + Playwright MCP workflow |
@@ -250,13 +277,20 @@ control channel.
 
 ### Dashboard Integration
 
-- **Globe button** in ChatInput toggles browse mode → sends `{ browse: true }` in POST
-- **Backend** prepends `[BROWSE]` marker to message when browse mode active
-- **Settings → Browser** panel: toggle extension mode, paste token, auto session restart
-- **BrowserAuthPrompt** component: notification banner when auth gate detected
+- **Settings → Browser** panel: turn Browser Mode on/off (the durable capability
+  toggle), pick the launch engine (`chromium` / `firefox` / `webkit`), toggle
+  extension (attach) mode, and paste the extension token. Enabling Browser Mode
+  triggers the Playwright install and re-registers the proxy.
+- **Backend** prepends the `[BROWSE]` marker to each message while Browser Mode is
+  enabled; browsing is default-on with no per-message chat toggle.
+- **BrowserAuthPrompt** component: notification banner when an auth gate is detected
 - **API endpoints:**
-  - `GET /api/browser/config` — read extension mode + token status
-  - `PUT /api/browser/config` — save extension mode + token (patches `mcp.json`, restarts sessions)
+  - `GET /api/browser/config`: read `enabled`, `engine`, `engines`, `installed`,
+    `extension_mode`, and `token` status
+  - `PUT /api/browser/config`: save `enabled`, `engine`, `extension_mode`, and
+    `token`. On a fresh enable this downloads `@playwright/mcp` + the engine
+    browser off the event loop and re-registers the proxy; a failed install
+    reports an actionable `code` in the body rather than 500-ing
   - `POST /api/browser-auth-retry` — retry auth (calls `ensure()`)
   - `POST /api/browser-event` — broadcast browser activity events via WebSocket
   - `POST /api/browser/frame` — ingest a browse screenshot, rebroadcast as `browser_frame` WS event, return live subscriber count (loopback-only, in `internal_paths`)
@@ -274,13 +308,18 @@ control channel.
 
 ### Platform Matrix
 
+Extension (attach) mode is Chromium-family only. The launch (headless) path lets
+the operator pick the engine (`chromium` / `firefox` / `webkit`, default
+`chromium`); `firefox` and `webkit` are Playwright's own builds, not the user's
+installed Firefox or Safari.
+
 | Platform | Mode | Auth | Browser |
 |----------|------|------|---------|
-| macOS | Extension (recommended) | Real Chrome session | User's Chrome via extension |
-| macOS | Headed (fallback) | Storage state + SPNEGO | Separate Chromium |
-| AL2/AL2023 x86_64 | Headless | Storage state + SPNEGO | Playwright Chromium |
-| AL2/AL2023 NICE DCV | Extension (opt-in) | Real Chrome session | User's Chrome via extension |
-| AL2 aarch64 (glibc 2.26) | Fallback | N/A | `ReadInternalWebsites` only |
+| macOS | Extension (attach, recommended) | Real browser session | User's Chromium-family browser (Chrome/Edge/Brave/Arc/Opera) via extension |
+| macOS | Launch (fallback) | Storage state + SPNEGO | Playwright's own `chromium`/`firefox`/`webkit` build |
+| AL2/AL2023 x86_64 | Launch (headless) | Storage state + SPNEGO | Playwright's own `chromium`/`firefox`/`webkit` build |
+| AL2/AL2023 NICE DCV | Extension (attach, opt-in) | Real browser session | User's Chromium-family browser via extension |
+| AL2 aarch64 (glibc 2.26) | Fallback | N/A | read-only `web_fetch` only |
 
 ### Credential Lifetimes
 

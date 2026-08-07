@@ -24,9 +24,18 @@ from kiro_crew.browser.command_bus import (
 )
 from kiro_crew.browser.screencast import BROWSER_FRAME_EVENT, build_frame_payload
 from kiro_crew.browser.setup import (
+    BROWSER_ENGINES,
+    browser_mode_enabled,
+    deregister_playwright_proxy,
+    ensure_playwright_installed,
+    generate_playwright_config,
+    get_browser_engine,
     get_extension_token,
     has_playwright_extension,
+    is_playwright_installed,
     register_playwright_proxy,
+    set_browser_engine,
+    set_browser_mode_enabled,
 )
 from kiro_crew.cron import CronStoreBusy
 from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
@@ -2125,7 +2134,7 @@ async def api_browser_auth_retry(request: web.Request) -> web.Response:
 
 
 async def api_browser_config_get(request: web.Request) -> web.Response:
-    """GET /api/browser/config — get browser extension mode and token status."""
+    """GET /api/browser/config — browser mode, engine, extension mode, token."""
     _sel().log_tool_invocation(
         session_key="dashboard",
         tool_name="browser_config_get",
@@ -2134,14 +2143,25 @@ async def api_browser_config_get(request: web.Request) -> web.Response:
     )
     return web.json_response(
         {
+            "enabled": browser_mode_enabled(),
+            "engine": get_browser_engine(),
+            "engines": list(BROWSER_ENGINES),
             "extension_mode": has_playwright_extension(),
             "token": get_extension_token() is not None,
+            "installed": is_playwright_installed(),
         }
     )
 
 
 async def api_browser_config_save(request: web.Request) -> web.Response:
-    """PUT /api/browser/config — save browser extension mode and token."""
+    """PUT /api/browser/config — save browser mode, engine, extension, token.
+
+    On a fresh enable this also downloads ``@playwright/mcp`` and the selected
+    engine's browser binary (bootstrapping Node if needed). The install runs off
+    the event loop and its result is reported in the body — a failed install
+    never 500s, so the persisted preference and an actionable ``code`` reach the
+    UI instead of a blank error.
+    """
     from kiro_crew.config.loader import data_home  # noqa: F811
 
     body = await request.json()
@@ -2152,6 +2172,20 @@ async def api_browser_config_save(request: web.Request) -> web.Response:
 
     extension_mode = body.get("extension_mode", False)
     token = body.get("token", "")
+    enabled = bool(body.get("enabled", False))
+
+    engine = body.get("engine", get_browser_engine())
+    if engine not in BROWSER_ENGINES:
+        return web.json_response(
+            {"ok": False, "code": "invalid_engine", "engine": engine},
+            status=400,
+        )
+
+    # Persist the durable preferences first so they survive even if the install
+    # below fails. This is the fix for the enable state not surviving a restart:
+    # it now lives in a data-home flag, not per-session React state.
+    set_browser_mode_enabled(enabled)
+    set_browser_engine(engine)
 
     if extension_mode:
         flag_file.touch()
@@ -2163,18 +2197,43 @@ async def api_browser_config_save(request: web.Request) -> web.Response:
         flag_file.unlink(missing_ok=True)
         token_file.unlink(missing_ok=True)
 
-    # Re-register through register_playwright_proxy rather than the patch
-    # primitives: it holds the shared mcp.json lock (so a concurrent app-bridge or
-    # dashboard MCP write is not clobbered), refuses to overwrite a user-authored
-    # non-proxy entry under the canonical key, and creates the file when a fresh
-    # install has no kiro settings yet. Blocking (file lock + disk I/O), so it
-    # runs off the event loop.
+    # Regenerate the launched-browser config so the persisted engine actually
+    # takes effect (the proxy launches `--config <playwright-config.json>`, whose
+    # ``browserName`` is the ONLY place the engine reaches Playwright). Also
+    # creates the file for a dashboard-only user who never ran the CLI setup, so
+    # `--config` never points at a missing path. Off the event loop (disk I/O).
+    if enabled:
+        await asyncio.to_thread(generate_playwright_config, engine)
+
+    # Download @playwright/mcp + the engine browser on enable. Run the installer
+    # whenever Browser Mode is on, NOT gated on launcher resolvability: `npx`
+    # being on PATH means the package can be fetched, not that the OS/arch browser
+    # binary is on disk, so gating on it would skip the one step that downloads
+    # the browser. The installer itself skips the npm install when a launcher
+    # already resolves and `playwright install` is an idempotent fast no-op when
+    # the browser is present, so a re-save stays cheap. Blocking (subprocess +
+    # network), so it runs off the event loop.
+    install_result: dict[str, Any] | None = None
+    if enabled:
+        install_result = await asyncio.to_thread(ensure_playwright_installed, engine)
+
+    # Tool availability is the gate (there is no per-message marker): enabling
+    # REGISTERS the proxy so the browser_* tools appear in the agent's tool list;
+    # disabling DEREGISTERS it so they disappear and "off" actually prevents
+    # browser operation. Both go through the setup helpers, which hold the shared
+    # mcp.json lock (so a concurrent app-bridge or dashboard MCP write is not
+    # clobbered), refuse to touch a user-authored non-proxy entry under the
+    # canonical key, and create/rewrite the file safely. Blocking (file lock +
+    # disk I/O), so off the event loop.
     #
-    # The mode preference above is already persisted, so an mcp.json-level failure
-    # is reported in the payload rather than raised — a 500 here would tell the
-    # user nothing was saved when the flag/token files were in fact written.
+    # The preferences above are already persisted, so an mcp.json-level failure is
+    # reported in the payload rather than raised — a 500 here would tell the user
+    # nothing was saved when the flag/engine files were in fact written.
     try:
-        _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
+        if enabled:
+            _, mcp_status = await asyncio.to_thread(register_playwright_proxy)
+        else:
+            _, mcp_status = await asyncio.to_thread(deregister_playwright_proxy)
     except OSError as exc:
         logger.warning("browser config: MCP registration failed: %s", exc)
         mcp_status = "registration-failed"
@@ -2184,12 +2243,23 @@ async def api_browser_config_save(request: web.Request) -> web.Response:
         tool_name="browser_config_save",
         outcome="completed",
         downstream_service="browser",
-        resources=f"extension_mode={extension_mode} mcp={mcp_status}",
+        resources=(
+            f"enabled={enabled} engine={engine} extension_mode={extension_mode} "
+            f"mcp={mcp_status}"
+        ),
     )
     # ``mcp_status`` is "kept-user-entry" when the caller's own hand-authored
-    # Playwright server was left in place — the mode preference was still saved,
+    # Playwright server was left in place — the preferences were still saved,
     # but KiroCrew's proxy was deliberately NOT written over their config.
-    return web.json_response({"ok": True, "mcp_status": mcp_status})
+    payload: dict[str, Any] = {
+        "ok": True,
+        "mcp_status": mcp_status,
+        "enabled": enabled,
+        "engine": engine,
+    }
+    if install_result is not None:
+        payload["install"] = install_result
+    return web.json_response(payload)
 
 
 # ── Slack configuration API ──
