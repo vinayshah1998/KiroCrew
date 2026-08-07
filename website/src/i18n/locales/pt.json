@@ -4603,22 +4603,12 @@
       "copy_url_of": "Copiar URL de {{name}}"
     },
     "linkedSurfacesSection": {
-      "confirm_release": "Desvincular esta sessão de {{label}}?\n\nAs mensagens enviadas lá deixarão de chegar aqui, e as respostas deixarão de ser entregues lá. Você pode vincular novamente com !sessions a partir desse canal.",
-      "confirm_stop_mirroring": "Parar de espelhar esta sessão em {{label}}?\n\nAs respostas não serão mais entregues lá. Você poderá vinculá-la novamente pelo seletor de canais configurados.",
-      "connected": "Conectado: {{label}}",
-      "mirror": "Espelho",
-      "mirror_stopped": "Espelhamento em {{label}} interrompido",
-      "offline": "Offline",
-      "origin": "Origem",
-      "post_reminder": "Publicar lembrete em {{label}}",
-      "release": "Desvincular de {{label}}",
-      "released": "Desvinculada de {{label}}",
-      "link_failed": "Não foi possível vincular o canal: {{reason}}",
-      "reminder_failed": "Não foi possível publicar o lembrete: {{reason}}",
-      "reminder_sent": "Lembrete publicado em {{label}}",
-      "stop_failed": "Não foi possível parar o espelhamento: {{reason}}",
-      "stop_mirroring": "Parar de espelhar em {{label}}",
-      "two_way": "Bidirecional",
+      "unknown_error": "erro desconhecido",
+      "confirm_takeover": "{{label}} já está conectado a outra sessão.\n\nConectá-lo aqui desconectará essa sessão. Continuar?",
+      "connect_failed": "Não foi possível conectar a {{label}}: {{reason}}",
+      "connect_to": "Conectar a {{label}}",
+      "disconnect_failed": "Não foi possível desconectar de {{label}}: {{reason}}",
+      "disconnect_from": "Desconectar de {{label}}",
       "unavailable": "Este destino está indisponível."
     },
     "logEntry": {
@@ -5330,11 +5320,6 @@
     "skillPickerMenu": {
       "loading_skills": "Carregando habilidades…",
       "no_matching_skills": "Nenhuma habilidade correspondente"
-    },
-    "slackLinkSection": {
-      "post_reminder_in_slack": "Publicar lembrete no Slack",
-      "send_to_slack": "Enviar para o Slack",
-      "unlink_from_slack": "Desvincular do Slack"
     },
     "slashCommandMenu": {
       "desc_agent": "Alternar ou gerenciar o agente ativo",
@@ -7087,6 +7072,7 @@
       "worktree_creation_returned_no_path": "A criação da worktree não retornou nenhum caminho"
     },
     "chatSidebar": {
+      "connected_to": "Conectado a {{label}}",
       "default_agent": "Agente padrão: {{name}}",
       "delete_folder_confirm": "Excluir \"{{name}}\"? As sessões serão desagrupadas.",
       "filter_tags": "Filtrar tags: {{name}}",
@@ -7175,7 +7161,6 @@
       "merged": "Mesclado",
       "min": "min",
       "dashboard_source": "Painel",
-      "mirroring_to": "Espelhando em {{label}}",
       "session_source": "Sessão",
       "model_list": "Lista de modelos",
       "more": "Mais",

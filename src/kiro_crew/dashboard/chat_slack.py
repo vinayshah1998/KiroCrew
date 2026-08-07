@@ -17,7 +17,11 @@ from kiro_crew.dashboard.chat_backfill import (
     session_deep_link,
 )
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
+from kiro_crew.dashboard.chat_utils import (
+    effective_session_key,
+    slack_mirror_is_paused,
+    slot_history_key,
+)
 from kiro_crew.dashboard.state import DashboardState, _log_task_exception
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security import redact_and_truncate
@@ -189,12 +193,41 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     # Check if already linked
     existing_ts, existing_chan = state.sessions.get_slack_link(session_key)
     if existing_ts and existing_chan:
-        try:
-            await state.slack_client.post_message(
-                existing_chan, "🔗 Session linked from dashboard — continuing here.", existing_ts
+        # A paused link is still a link, so it lands here -- and this is the
+        # reconnect path. Resume in place: clear the pause, re-bind through the
+        # canonical writer, and re-seed the thread so the user picks up where
+        # they left off rather than scrolling back past the quiet stretch.
+        if slack_mirror_is_paused(state, session_key):
+            state.sessions.set_slack_paused(session_key, False)
+            state.link_slack(slot.key, existing_ts, existing_chan)
+            # Deliberately NOT gated on the "new thread only" rule the fresh-link
+            # path below uses: re-seeding is the whole point of reconnect, and the
+            # thread has a gap in it precisely because mirroring was off.
+            _spawn_slack_backfill(state, slot, existing_chan, existing_ts)
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.slack_reconnect",
+                outcome="success",
+                source="dashboard",
+                resources=slot.key,
             )
-        except Exception:
-            pass
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "ok": True,
+                    "reconnected": True,
+                    "thread_ts": existing_ts,
+                    "channel": existing_chan,
+                }
+            )
+        # Connecting a link that is already live is a NO-OP, and silently so. This
+        # branch used to post "Session linked from dashboard — continuing here."
+        # into the thread, which existed for exactly one caller: the "Post reminder
+        # in Slack" menu item, whose whole job was to call this endpoint on a live
+        # link to ping the thread. That item is gone, so the only ways to arrive
+        # here now are a stale dashboard tab racing a connected one, or a direct API
+        # call — and in both cases a stray message appearing in the thread explains
+        # nothing to the person reading it.
         return web.json_response(
             {"ok": True, "already_linked": True, "thread_ts": existing_ts, "channel": existing_chan}
         )
@@ -322,6 +355,68 @@ async def api_chat_slot_slack_unlink(request: web.Request) -> web.Response:
     )
     state.push_slots_update()
     return web.json_response({"ok": True, "was_linked": cleared})
+
+
+async def api_chat_slot_slack_pause(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/slack-pause — mute the linked thread, keep the binding.
+
+    Pause is not unlink. The thread↔session binding, both coordinate fields and
+    the reverse index all survive, so inbound routing is untouched: a reply in
+    the paused thread still resolves to THIS session and resumes it, rather than
+    forking a new one the way a hard unlink does. Only outbound turn mirroring
+    stops (see ``chat_utils.slack_mirror_is_paused`` for the exact scope).
+
+    Resume happens either by replying in the thread or by re-issuing
+    ``slack-link``, which detects the paused link and re-seeds the thread.
+
+    Idempotent: pausing an already-paused session reports ``was_paused: true``
+    and posts no second note. Auth posture is identical to slack-link and
+    slack-unlink — mixed-internal via the ``/api/chat`` prefix, needing no new
+    entry in either path set.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info.get("name") or request.match_info.get("slot", "")
+    slot = state.get_slot(name) or state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # The slot's OWN session key. Deriving it from the slot NAME would build
+    # "dashboard:slack:<ts>" for a channel-born slot and pause a session that
+    # does not exist, leaving the real thread mirroring.
+    session_key = effective_session_key(slot)
+    thread_ts, channel_id = state.sessions.get_slack_link(session_key)
+    if not (thread_ts and channel_id):
+        return web.json_response(
+            {"error": "not linked", "code": "slack_not_linked"}, status=409
+        )
+
+    was_paused = state.sessions.set_slack_paused(session_key, True)
+
+    # Posted INTO the Slack thread, not shown in the dashboard. Without it the
+    # thread simply dead-ends and anyone watching it cannot tell a disconnected
+    # conversation from a stalled one. Only on the transition, so an idempotent
+    # re-disconnect stays silent. It states the fact and stops: that a reply
+    # reconnects is a given, not something to advertise.
+    if not was_paused and state.slack_client:
+        try:
+            await state.slack_client.post_message(
+                channel_id,
+                "\U0001f50c _Disconnected — the conversation continues in the "
+                "dashboard._",
+                thread_ts,
+            )
+        except Exception:
+            logger.debug("Failed to post disconnect courtesy note to Slack", exc_info=True)
+
+    sel().log_api_access(
+        caller="dashboard",
+        operation="chat.slack_pause",
+        outcome="noop" if was_paused else "success",
+        source="dashboard",
+        resources=slot.key,
+    )
+    state.push_slots_update()
+    return web.json_response({"ok": True, "was_paused": was_paused})
 
 
 async def list_slack_channels(state: DashboardState) -> list[dict]:

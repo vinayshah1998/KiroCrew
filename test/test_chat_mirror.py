@@ -290,10 +290,318 @@ class TestMirrorUnlink:
             assert resp.status == 200
             assert (await resp.json())["was_linked"] is False
 
+    @pytest.mark.asyncio
+    async def test_unlink_is_scoped_to_the_channel_the_caller_names(
+        self, tmp_path, monkeypatch
+    ):
+        """The header chip names ONE channel; the unnamed clear drops every binding.
+
+        Releasing the Discord the chip labels must not also delete a Telegram
+        binding the user never mentioned — that would strip its `accepts_inbound`
+        and fork the next Telegram message into a fresh, historyless session.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.clear_mirror_link = MagicMock(return_value=True)
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink", json={"channel_type": "discord"}
+            )
+            assert resp.status == 200
+        _key, channel_type = state.sessions.clear_mirror_link.call_args[0]
+        assert channel_type == "discord"
+
+    @pytest.mark.asyncio
+    async def test_unlink_reads_a_chunked_body_rather_than_content_length(
+        self, tmp_path, monkeypatch
+    ):
+        """A chunked POST has `content_length is None`.
+
+        Branching on Content-Length would read no `channel_type` and silently
+        widen a scoped release into "clear everything" — the same defect the link
+        handler documents.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.clear_mirror_link = MagicMock(return_value=True)
+
+        async def chunked():
+            yield b'{"channel_type": "discord"}'
+
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/mirror-unlink", data=chunked())
+            assert resp.status == 200
+        _key, channel_type = state.sessions.clear_mirror_link.call_args[0]
+        assert channel_type == "discord"
+
+    @pytest.mark.asyncio
+    async def test_unlink_rejects_a_malformed_body_with_400_not_500(
+        self, tmp_path, monkeypatch
+    ):
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.clear_mirror_link = MagicMock(return_value=True)
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                data=b"{not json",
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "body_not_json"
+        state.sessions.clear_mirror_link.assert_not_called()
+
+
+class TestTakeoverConsentIsStrict:
+    """Consent is a boolean or it is absent.
+
+    A body carrying `{"confirm": "false"}` — or any non-empty string, or 0/1 from a
+    sloppy client — read as truthy and evicted another session's binding without
+    the user ever seeing the prompt.
+    """
+
+    @staticmethod
+    def _prepped(tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_permits",
+            lambda *args, **kwargs: SimpleNamespace(permitted=True),
+        )
+        state = _prep(tmp_path, monkeypatch)
+        state.register_channel_transport(_fake_transport("discord"))
+        state.sessions.find_mirror_sessions = MagicMock(return_value=["dashboard:other"])
+        state.sessions.clear_mirror_links_at = MagicMock(return_value=["dashboard:other"])
+        state.sessions.set_mirror_link = MagicMock()
+        return state
+
+    @staticmethod
+    async def _connect(state, confirm):
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={
+                    "channel_type": "discord", "target_id": "user:123", "confirm": confirm,
+                },
+            )
+            return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    async def test_the_string_false_does_not_count_as_confirmation(
+        self, tmp_path, monkeypatch
+    ):
+        state = self._prepped(tmp_path, monkeypatch)
+
+        status, body = await self._connect(state, "false")
+
+        assert status == 409
+        assert body["code"] == "conversation_occupied"
+        state.sessions.set_mirror_link.assert_not_called()
+        state.sessions.clear_mirror_links_at.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_truthy_non_boolean_does_not_count_either(self, tmp_path, monkeypatch):
+        state = self._prepped(tmp_path, monkeypatch)
+
+        status, _body = await self._connect(state, 1)
+
+        assert status == 409
+        state.sessions.set_mirror_link.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_real_boolean_true_still_takes_the_conversation(
+        self, tmp_path, monkeypatch
+    ):
+        """Non-vacuity: the strict check must not break actual consent."""
+        state = self._prepped(tmp_path, monkeypatch)
+
+        status, _body = await self._connect(state, True)
+
+        assert status == 200
+        state.sessions.set_mirror_link.assert_called_once()
+        state.sessions.clear_mirror_links_at.assert_called_once()
+
+
+class TestTheOccupancyCheckIsRecheckedAtTheCommit:
+    """The first check is a stale snapshot by the time the binding is written.
+
+    Three awaited sends sit between them (target resolution, the link notice, the
+    catch-up), so two concurrent connects could both pass the first check and both
+    persist an inbound binding — after which the resolver refuses to route and the
+    conversation reaches NOBODY.
+    """
+
+    @staticmethod
+    def _prepped(tmp_path, monkeypatch, *, occupants_over_time):
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_permits",
+            lambda *args, **kwargs: SimpleNamespace(permitted=True),
+        )
+        state = _prep(tmp_path, monkeypatch)
+        state.register_channel_transport(_fake_transport("discord"))
+        # Each call returns the next snapshot: empty at the first check, occupied
+        # by the time we commit — a rival connect that landed mid-delivery.
+        state.sessions.find_mirror_sessions = MagicMock(side_effect=occupants_over_time)
+        state.sessions.clear_mirror_links_at = MagicMock(return_value=["dashboard:rival"])
+        state.sessions.set_mirror_link = MagicMock()
+        return state
+
+    @staticmethod
+    async def _connect(state, **extra):
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "discord", "target_id": "user:123", **extra},
+            )
+            return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    async def test_a_rival_that_lands_mid_delivery_is_not_silently_evicted(
+        self, tmp_path, monkeypatch
+    ):
+        """The user confirmed nothing about THIS occupant, so it must ask again."""
+        state = self._prepped(
+            tmp_path, monkeypatch,
+            occupants_over_time=[[], ["dashboard:rival"]],
+        )
+
+        status, body = await self._connect(state)
+
+        assert status == 409
+        assert body["code"] == "conversation_occupied"
+        # Neither binding was touched: no duplicate owners, no silent eviction.
+        state.sessions.set_mirror_link.assert_not_called()
+        state.sessions.clear_mirror_links_at.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_confirmed_takeover_still_evicts_a_late_arrival(
+        self, tmp_path, monkeypatch
+    ):
+        """`confirm` means "take it" — including from whoever holds it at commit."""
+        state = self._prepped(
+            tmp_path, monkeypatch,
+            occupants_over_time=[["dashboard:first"], ["dashboard:rival"]],
+        )
+
+        status, _body = await self._connect(state, confirm=True)
+
+        assert status == 200
+        state.sessions.clear_mirror_links_at.assert_called_once()
+        state.sessions.set_mirror_link.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unoccupied_conversation_commits_without_a_second_prompt(
+        self, tmp_path, monkeypatch
+    ):
+        """Non-vacuity: the re-check must not add a prompt to the ordinary path."""
+        state = self._prepped(tmp_path, monkeypatch, occupants_over_time=[[], []])
+
+        status, _body = await self._connect(state)
+
+        assert status == 200
+        state.sessions.set_mirror_link.assert_called_once()
+        state.sessions.clear_mirror_links_at.assert_not_called()
+
+
+class TestOneSessionPerConversation:
+    """A conversation hosts exactly one session, and taking it is confirmed.
+
+    A Discord DM cannot hold threads, so there is nothing to scope two bindings
+    to: with two, the inbound resolver refuses to pick and a message in that
+    conversation reaches NOBODY. Eviction is what keeps "replying reconnects it"
+    unambiguous — the same last-writer-wins guarantee Slack gets for free from its
+    single-valued thread index.
+    """
+
+    @staticmethod
+    def _prepped(tmp_path, monkeypatch, *, occupied_by=()):
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_permits",
+            lambda *args, **kwargs: SimpleNamespace(permitted=True),
+        )
+        state = _prep(tmp_path, monkeypatch)
+        transport = _fake_transport("discord")
+        state.register_channel_transport(transport)
+        state.sessions.find_mirror_sessions = MagicMock(return_value=list(occupied_by))
+        state.sessions.clear_mirror_links_at = MagicMock(return_value=list(occupied_by))
+        state.sessions.set_mirror_link = MagicMock()
+        return state, transport
+
+    @staticmethod
+    async def _connect(state, **extra):
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "discord", "target_id": "user:123", **extra},
+            )
+            return resp.status, await resp.json()
+
+    @pytest.mark.asyncio
+    async def test_connecting_an_occupied_conversation_asks_first(self, tmp_path, monkeypatch):
+        state, transport = self._prepped(tmp_path, monkeypatch, occupied_by=["dashboard:other"])
+
+        status, body = await self._connect(state)
+
+        assert status == 409
+        assert body["code"] == "conversation_occupied"
+        assert body["requires_confirm"] is True
+        # Refused BEFORE any side effect: nothing announced, nothing evicted,
+        # nothing bound. A confirm the user has not given cannot cost them a
+        # session's connection.
+        transport.send_message.assert_not_awaited()
+        state.sessions.clear_mirror_links_at.assert_not_called()
+        state.sessions.set_mirror_link.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_confirmed_takeover_evicts_and_tells_the_conversation(
+        self, tmp_path, monkeypatch
+    ):
+        state, transport = self._prepped(tmp_path, monkeypatch, occupied_by=["dashboard:other"])
+
+        status, _ = await self._connect(state, confirm=True)
+
+        assert status == 200
+        state.sessions.clear_mirror_links_at.assert_called_once()
+        # Whoever is reading that conversation is told which session they are
+        # talking to now — the eviction is not silent on the channel side.
+        sent = [call.args[1] for call in transport.send_message.await_args_list]
+        assert any("different session is connected here now" in text for text in sent)
+
+    @pytest.mark.asyncio
+    async def test_a_free_conversation_needs_no_confirm(self, tmp_path, monkeypatch):
+        state, transport = self._prepped(tmp_path, monkeypatch)
+
+        status, _ = await self._connect(state)
+
+        assert status == 200
+        state.sessions.clear_mirror_links_at.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_connect_makes_replies_route_back_to_this_session(
+        self, tmp_path, monkeypatch
+    ):
+        """The reported defect: connect a session, reply in Discord, and the reply
+        landed in a brand-new channel-born tab.
+
+        The inbound resolver only counts bindings flagged ``accepts_inbound``, and
+        the dashboard's connect never set it — so the resolver found no owner and
+        fell through to the conversation's own session key.
+        """
+        state, _ = self._prepped(tmp_path, monkeypatch)
+
+        status, _ = await self._connect(state)
+
+        assert status == 200
+        _, kwargs = state.sessions.set_mirror_link.call_args
+        assert kwargs["accepts_inbound"] is True
+
 
 class TestMirrorReminder:
     @pytest.mark.asyncio
-    async def test_existing_live_mirror_posts_reminder(self, tmp_path, monkeypatch):
+    async def test_existing_live_mirror_is_a_silent_no_op(self, tmp_path, monkeypatch):
+        """Connecting an already-connected channel does nothing, and says nothing.
+
+        This used to post "Session linked from dashboard — continuing here." for
+        the "Post reminder in <channel>" menu item. That row is gone, so the only
+        ways to arrive here are a stale dashboard tab racing a connected one or a
+        direct API call — and in both cases a stray message in the conversation
+        explains nothing to whoever reads it.
+        """
         monkeypatch.setattr(
             "kiro_crew.platform.governance_profiles.governance_permits",
             lambda *args, **kwargs: SimpleNamespace(permitted=True),
@@ -304,6 +612,7 @@ class TestMirrorReminder:
         state.sessions.get_mirror_link = MagicMock(
             return_value=ChannelLink("discord", channel_id="356163505868767244")
         )
+        state.sessions.is_mirror_paused = MagicMock(return_value=False)
 
         async with TestClient(TestServer(_make_mirror_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/mirror-link")
@@ -314,11 +623,54 @@ class TestMirrorReminder:
                 "channel_type": "discord",
             }
 
-        transport.send_message.assert_awaited_once_with(
-            "356163505868767244",
-            "🔗 Session linked from dashboard — continuing here.",
-            thread_id=None,
+        transport.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_muted_mirror_reconnects_and_catches_the_conversation_up(
+        self, tmp_path, monkeypatch
+    ):
+        """The same empty-body call on a MUTED link is the reconnect.
+
+        It lifts the mute through ``set_mirror_link`` — the rebind is what clears
+        the flag — and seeds the conversation with the history it missed, because
+        the gap in it is there precisely because delivery was off.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.platform.governance_profiles.governance_permits",
+            lambda *args, **kwargs: SimpleNamespace(permitted=True),
         )
+        state = _prep(tmp_path, monkeypatch)
+        transport = _fake_transport("discord")
+        state.register_channel_transport(transport)
+        link = ChannelLink("discord", channel_id="356163505868767244")
+        state.sessions.get_mirror_link = MagicMock(return_value=link)
+        state.sessions.is_mirror_paused = MagicMock(return_value=True)
+        state.sessions.set_mirror_link = MagicMock()
+        # History for the catch-up to carry. Without it there is nothing to send
+        # and the test would pass on an empty delivery.
+        slot = state.get_or_create_slot("s1")
+        slot.append("user", "what changed while I was away")
+        slot.append("assistant", "the lint rule moved")
+        slot.drain()
+
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/mirror-link")
+            assert resp.status == 200
+            body = await resp.json()
+
+        assert body["reconnected"] is True
+        assert body["conversation_id"] == "356163505868767244"
+        # The rebind is the un-mute, and it must land AFTER a successful catch-up.
+        # accepts_inbound is re-asserted so a reply in that conversation resumes
+        # THIS session rather than starting a channel-born one.
+        state.sessions.set_mirror_link.assert_called_once_with(
+            "dashboard:s1", link, accepts_inbound=True
+        )
+        # Catch-up delivered the missed history: this is the difference between a
+        # reconnect and the silent no-op above.
+        sent = "\n".join(call.args[1] for call in transport.send_message.await_args_list)
+        assert "what changed while I was away" in sent
+        assert "the lint rule moved" in sent
 
     @pytest.mark.asyncio
     async def test_partial_body_validates_instead_of_posting(self, tmp_path, monkeypatch):

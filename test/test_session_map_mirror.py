@@ -35,11 +35,19 @@ class TestNonSlackMirror:
         got = session_map.get_mirror_link("dashboard:chat-1")
         assert got == link
 
-    def test_stored_under_mirror_field(self, session_map):
+    def test_stored_under_mirrors_keyed_by_channel_type(self, session_map):
+        """One binding per channel type, so the map is keyed by it.
+
+        This asserts the on-disk SHAPE, which changed when a session became able
+        to hold several bindings. The legacy single-``mirror`` shape is still
+        read (see TestLegacySingleBindingCompat) — it is simply no longer written.
+        """
         session_map.set_mirror_link(
             "dashboard:chat-1", ChannelLink(channel_type="telegram", channel_id="99")
         )
-        assert session_map._data["dashboard:chat-1"]["mirror"]["channel_type"] == "telegram"
+        entry = session_map._data["dashboard:chat-1"]
+        assert entry["mirrors"]["telegram"]["channel_id"] == "99"
+        assert "mirror" not in entry
 
     def test_does_not_touch_slack_link(self, session_map):
         session_map.set_mirror_link(

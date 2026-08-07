@@ -297,6 +297,7 @@ class SessionMap:
                     not entry.get("sid")
                     and not entry.get("slack_thread_ts")
                     and not entry.get("mirror")
+                    and not entry.get("mirrors")
                 )
             )
         ]
@@ -309,7 +310,15 @@ class SessionMap:
         return len(stale)
 
     def set_slack_link(self, key: str, thread_ts: str, channel_id: str | None) -> None:
-        """Link a session to a Slack thread. Creates entry if needed."""
+        """Link a session to a Slack thread. Creates entry if needed.
+
+        Establishing a link DROPS any ``slack_paused`` marker: a bind replaces the
+        link, so it must not inherit the previous one's mute. Without this a
+        handoff release (``set_slack_link(key, "", "")``, which unlike
+        ``clear_slack_link`` leaves the flag) would leave the next thread bound to
+        this row born muted — no echo, no reply, no tool stream. Same rule the
+        channel bindings follow in ``set_mirror_link``.
+        """
         key = canonical_key(key)
         entry = self._data.get(key)
         if entry:
@@ -324,6 +333,10 @@ class SessionMap:
                 self._thread_to_session.pop(old_ts, None)
             entry["slack_thread_ts"] = thread_ts
             entry["slack_channel_id"] = channel_id
+            # Only on a real bind. The empty-string form is a RELEASE, and popping
+            # here would make it indistinguishable from `clear_slack_link`.
+            if thread_ts:
+                entry.pop("slack_paused", None)
         else:
             self._data[key] = {
                 "sid": "",
@@ -343,10 +356,10 @@ class SessionMap:
     def clear_slack_link(self, key: str) -> bool:
         """Remove the Slack link from a session, keeping the session itself.
 
-        Clears only ``slack_thread_ts`` + ``slack_channel_id`` (preserves
-        ``sid`` and the entry) and evicts the ``_thread_to_session`` reverse
-        index so a later Slack reply in the old thread does not re-route to
-        this session and silently re-engage mirroring. Returns True iff a link
+        Clears the two coordinate fields plus any ``slack_paused`` marker
+        (preserves ``sid`` and the entry) and evicts the ``_thread_to_session``
+        reverse index so a later Slack reply in the old thread does not re-route
+        to this session and silently re-engage mirroring. Returns True iff a link
         was present (only then is ``_save()`` called).
         """
         entry = self._data.get(canonical_key(key))
@@ -358,9 +371,89 @@ class SessionMap:
             del self._thread_to_session[old_ts]
         entry.pop("slack_thread_ts", None)
         entry.pop("slack_channel_id", None)
+        # A pause describes a link, so it must not outlive one: left behind, it
+        # would re-pause a future link to this session that nobody paused.
+        # ``had_link`` deliberately still keys on the two coordinate fields --
+        # pause is only ever set on an already-linked entry, so a paused entry
+        # always has a link to report, and a lone flag must not make an
+        # unlinked session report that a link was cleared.
+        entry.pop("slack_paused", None)
         if had_link:
             self._save()
         return had_link
+
+    def _pause_keys(self, key: str) -> list[str]:
+        """Every spelling a dashboard session's link can be stored under.
+
+        ``chat_runner`` copies a dashboard session's link from the bare key onto
+        the ``dashboard:``-prefixed one when a turn runs, so a pause written to
+        one spelling alone would be read back from the other and silently lost.
+        Owning that here means no call site has to remember it. A channel key
+        (``slack:<ts>``) has no twin, so it yields a single spelling.
+        """
+        canonical = canonical_key(key)
+        keys = [canonical]
+        if canonical.startswith("dashboard:"):
+            keys.append(canonical[len("dashboard:") :])
+        return keys
+
+    def set_slack_paused(self, key: str, paused: bool) -> bool:
+        """Pause or resume outbound mirroring, keeping the thread binding.
+
+        Returns the PREVIOUS state, so an idempotent endpoint can report whether
+        it changed anything without a second read.
+
+        Stored as a presence flag -- ``True`` or absent, never ``False`` --
+        matching ``mirror_accepts_inbound`` above, so resuming leaves nothing
+        behind on disk rather than accreting a false-valued key. ``_save`` runs
+        only on a real transition, so a steady stream of replies to an already
+        resumed thread costs no disk writes.
+        """
+        was_paused = False
+        changed = False
+        for candidate in self._pause_keys(key):
+            entry = self._data.get(candidate)
+            if entry is None:
+                continue
+            if entry.get("slack_paused") is True:
+                was_paused = True
+                if not paused:
+                    del entry["slack_paused"]
+                    changed = True
+            elif paused:
+                entry["slack_paused"] = True
+                changed = True
+        if changed:
+            self._save()
+        return was_paused
+
+    def is_slack_paused(self, key: str) -> bool:
+        """True when this session's outbound Slack mirroring is paused.
+
+        The thread binding itself is untouched by a pause, so this is the ONLY
+        signal that distinguishes a muted link from a live one. Inbound routing
+        deliberately does not consult it: a reply must still reach the session
+        that owns the thread, which is what makes reply-to-resume land in the
+        original conversation instead of forking a new one.
+
+        A live link is REQUIRED on the row carrying the flag. ``clear_slack_link``
+        pops the flag, but ``set_slack_link(key, "", "")`` — how a Slack-side
+        handoff releases the previous owner — empties the coordinates and leaves it
+        behind. Without this check the flag outlives its link, and the next thread
+        bound to that row is born muted: no echo, no reply, no tool stream, and the
+        row snaps back to "Connect to Slack" the moment after the user connected
+        it. Same invariant ``set_slack_paused`` states — a pause must not outlive
+        the link it describes.
+        """
+        for candidate in self._pause_keys(key):
+            entry = self._data.get(candidate)
+            if (
+                entry is not None
+                and entry.get("slack_paused") is True
+                and entry.get("slack_thread_ts")
+            ):
+                return True
+        return False
 
     def get_session_for_thread(self, thread_ts: str) -> str | None:
         """Return the session key linked to a Slack thread_ts, or None."""
@@ -374,7 +467,54 @@ class SessionMap:
     # a ``ChannelLink`` so the dashboard turn path can deliver a reply to any
     # proactive-capable channel via ``Transport.send_message`` without
     # special-casing Slack. Slack routes back through the dedicated fields;
-    # every other channel stores a ``ChannelLink`` under ``mirror``.
+    # every other channel stores a ``ChannelLink`` under ``mirrors``.
+
+    @staticmethod
+    def _mirrors(entry: dict | None) -> dict[str, dict]:
+        """Read an entry's non-Slack bindings as ``{channel_type: binding}``.
+
+        One binding per channel type per session: a session may mirror to Discord
+        AND Telegram at once, but never to two Discord conversations — which is
+        the product rule (a conversation hosts one session, so a session holding
+        two of the same channel could not be addressed unambiguously either).
+
+        Read-compat, never migrating on read: an entry written before multi-bind
+        carries a single ``mirror`` dict plus entry-level ``mirror_accepts_inbound``
+        / ``mirror_paused`` flags. Those are folded into the same shape here, so
+        every reader sees one format and no file is rewritten just by being read.
+        """
+        if not entry:
+            return {}
+        mirrors = entry.get("mirrors")
+        if isinstance(mirrors, dict):
+            return {k: v for k, v in mirrors.items() if isinstance(v, dict)}
+        legacy = entry.get("mirror")
+        if not isinstance(legacy, dict):
+            return {}
+        channel_type = str(legacy.get("channel_type") or "")
+        if not channel_type:
+            return {}
+        folded = dict(legacy)
+        if entry.get("mirror_accepts_inbound"):
+            folded["accepts_inbound"] = True
+        if entry.get("mirror_paused"):
+            folded["paused"] = True
+        return {channel_type: folded}
+
+    def _write_mirrors(self, entry: dict, mirrors: dict[str, dict]) -> None:
+        """Persist the binding map, retiring the legacy single-binding keys.
+
+        Writing is the migration point: once a session's bindings are written in
+        the new shape the legacy keys are dropped, so a row never carries both
+        and no reader has to decide which one wins.
+        """
+        if mirrors:
+            entry["mirrors"] = mirrors
+        else:
+            entry.pop("mirrors", None)
+        entry.pop("mirror", None)
+        entry.pop("mirror_accepts_inbound", None)
+        entry.pop("mirror_paused", None)
 
     def set_mirror_link(
         self,
@@ -385,10 +525,14 @@ class SessionMap:
     ) -> None:
         """Bind (or clear, when *link* is None) a session's mirror target.
 
-        ``accepts_inbound`` marks a non-Slack mirror as a session-resume binding:
+        Scoped to the link's OWN channel type: binding Discord leaves a Telegram
+        binding on the same session untouched, and re-binding Discord replaces
+        only the Discord one. Passing None clears every non-Slack binding, which
+        is what the historical single-binding contract meant.
+
+        ``accepts_inbound`` marks the binding as a session-resume target:
         messages arriving from that exact channel location may be routed back to
-        *key*. Ordinary dashboard mirrors remain outbound-only. Slack keeps its
-        dedicated reverse index and therefore ignores this flag.
+        *key*. Slack keeps its dedicated reverse index and ignores this flag.
         """
         if link is None:
             self.clear_mirror_link(key)
@@ -397,12 +541,30 @@ class SessionMap:
             self.set_slack_link(key, link.thread_id or "", link.channel_id)
             return
         key = canonical_key(key)
+        # Bindings may live on the legacy `dashboard:`-spelled row. Read them from
+        # wherever they actually are and write the whole set onto the canonical
+        # row, then empty the legacy one — otherwise adding a SECOND channel makes
+        # the canonical row win `_mirror_key` and the legacy row's binding vanishes
+        # from delivery and from the UI while still occupying its location. Under
+        # single-binding that supersession was correct (the new binding replaced
+        # the old one); with several it would silently orphan a sibling.
+        active = self._mirror_key(key)
         entry = self._ensure_entry(key)
-        entry["mirror"] = link.to_dict()
+        mirrors = self._mirrors(self._data.get(active))
+        binding = link.to_dict()
+        # A rebind replaces the binding, so it must not inherit the previous
+        # one's mute: this writer is how a reconnect re-establishes a link, and a
+        # stale paused flag would leave the new binding silently muted.
         if accepts_inbound:
-            entry["mirror_accepts_inbound"] = True
-        else:
-            entry.pop("mirror_accepts_inbound", None)
+            binding["accepts_inbound"] = True
+        mirrors[link.channel_type] = binding
+        self._write_mirrors(entry, mirrors)
+        if active != key:
+            legacy = self._data.get(active)
+            if legacy is not None:
+                # The bindings moved to the canonical row; leaving copies behind
+                # would double-count this session in every by-location scan.
+                self._write_mirrors(legacy, {})
         self._save()
 
     def _mirror_key(self, key: str) -> str:
@@ -419,47 +581,133 @@ class SessionMap:
         """
         canon = canonical_key(key)
         entry = self._data.get(canon)
-        if entry and entry.get("mirror") is not None:
+        if self._mirrors(entry):
             return canon
         if is_channel_session_key(canon):
             legacy = self._data.get(legacy_dashboard_mirror_key(canon))
-            if legacy and legacy.get("mirror") is not None:
+            if self._mirrors(legacy):
                 return legacy_dashboard_mirror_key(canon)
         return canon
 
-    def get_mirror_link(self, key: str) -> ChannelLink | None:
-        """Return a session's outbound mirror target as a channel-neutral link.
+    def set_mirror_paused(self, key: str, paused: bool, channel_type: str = "") -> bool:
+        """Mute or unmute one binding, keeping it bound. Returns the PREVIOUS state.
 
-        Reads the explicit ``mirror`` binding first; for a legacy Slack session
-        that only carries ``slack_thread_ts`` / ``slack_channel_id`` it
-        synthesizes the equivalent Slack ``ChannelLink`` so callers never have
-        to special-case Slack. Returns None when the session mirrors nowhere.
+        Per binding, not per session: muting Discord leaves a Telegram binding on
+        the same session delivering. With no ``channel_type`` it applies to every
+        non-Slack binding the session holds, and reports whether they were ALL
+        already in that state — which keeps the historical single-binding
+        contract (and its idempotent ``was_paused``) exactly as it was.
+
+        It REFUSES to create an entry or a binding: a mute that outlives the link
+        it describes would silently mute a future rebind, so a session with no
+        matching binding is a no-op.
         """
+        mkey = self._mirror_key(key)
+        entry = self._data.get(mkey)
+        mirrors = self._mirrors(entry)
+        targets = [channel_type] if channel_type else list(mirrors)
+        present = [t for t in targets if t in mirrors]
+        if entry is None or not present:
+            return False
+        was_paused = all(mirrors[t].get("paused") is True for t in present)
+        changed = False
+        for target in present:
+            binding = mirrors[target]
+            if paused and binding.get("paused") is not True:
+                binding["paused"] = True
+                changed = True
+            elif not paused and binding.pop("paused", None) is not None:
+                changed = True
+        if changed:
+            self._write_mirrors(entry, mirrors)
+            self._save()
+        return was_paused
+
+    def is_mirror_paused(self, key: str, channel_type: str = "") -> bool:
+        """True when the named binding is muted (or, with no name, when EVERY
+        non-Slack binding is).
+
+        The binding itself is untouched by a mute, so this is the ONLY thing
+        separating "muted" from "not linked" — every inbound resolver, the
+        resume-conflict check and both clear paths must still see the link.
+
+        The all-must-be-muted reading is what makes the outbound gate safe under
+        multi-binding: one muted channel must never silence a sibling that is
+        still connected.
+        """
+        mirrors = self._mirrors(self._data.get(self._mirror_key(key)))
+        if channel_type:
+            binding = mirrors.get(channel_type)
+            return bool(binding and binding.get("paused"))
+        return bool(mirrors) and all(b.get("paused") for b in mirrors.values())
+
+    def get_mirror_links(self, key: str) -> list[ChannelLink]:
+        """Every non-Slack binding this session holds, in channel-type order.
+
+        The list form is what outbound delivery and the dashboard's link
+        projection need: a session may mirror to several channels at once and
+        each has to be resolved, governed and rendered on its own.
+        """
+        mirrors = self._mirrors(self._data.get(self._mirror_key(key)))
+        links: list[ChannelLink] = []
+        for channel_type in sorted(mirrors):
+            raw = dict(mirrors[channel_type])
+            raw.pop("accepts_inbound", None)
+            raw.pop("paused", None)
+            raw.setdefault("channel_type", channel_type)
+            try:
+                links.append(ChannelLink.from_dict(raw))
+            except (TypeError, ValueError):
+                continue
+        return links
+
+    def get_mirror_link(self, key: str, channel_type: str = "") -> ChannelLink | None:
+        """One binding, by channel type — or the session's only one when unnamed.
+
+        Kept single-valued for the many callers that already know which channel
+        they mean (an in-channel ``!link``, an occupancy check, a reconnect for
+        one row). With no ``channel_type`` it returns the sole binding, or None
+        when the session holds several, so a caller that assumes one binding can
+        never silently act on an arbitrary sibling.
+
+        For a legacy Slack session carrying only ``slack_thread_ts`` /
+        ``slack_channel_id`` it synthesizes the equivalent Slack ``ChannelLink``
+        so callers never have to special-case Slack.
+        """
+        links = self.get_mirror_links(key)
+        if channel_type:
+            return next((link for link in links if link.channel_type == channel_type), None)
+        if len(links) == 1:
+            return links[0]
+        if links:
+            return None
         entry = self._data.get(self._mirror_key(key))
         if not entry:
             return None
-        raw = entry.get("mirror")
-        if raw:
-            return ChannelLink.from_dict(raw)
         ts = entry.get("slack_thread_ts")
         ch = entry.get("slack_channel_id")
         if ts or ch:
             return ChannelLink(channel_type=SLACK_NAMESPACE, channel_id=ch, thread_id=ts)
         return None
 
-    def mirror_accepts_inbound(self, key: str) -> bool:
-        """True iff this session's mirror is a session-RESUME binding.
+    def mirror_accepts_inbound(self, key: str, channel_type: str = "") -> bool:
+        """True iff a binding is a session-RESUME target (messages route back).
 
         The read counterpart of ``set_mirror_link(accepts_inbound=True)``.
-        ``get_mirror_link`` deliberately returns a plain ``ChannelLink``, which
-        cannot carry the flag, so a caller that needs to tell a two-way resume
-        from an outbound-only mirror (e.g. the dashboard's link projection, which
-        must not offer a one-way mirror the affordances of a resumed session)
-        asks here. Slack is excluded: it routes inbound through its own
-        ``_thread_to_session`` index and never sets this marker.
+        ``ChannelLink`` cannot carry the flag, so a caller that needs to tell a
+        two-way resume from an outbound-only mirror asks here. With no
+        ``channel_type`` it answers for ANY binding, matching the historical
+        single-binding contract. Slack is excluded: it routes inbound through its
+        own ``_thread_to_session`` index and never sets this marker.
         """
-        entry = self._data.get(canonical_key(key))
-        return bool(entry and entry.get("mirror_accepts_inbound"))
+        # Resolves through `_mirror_key`, like every other binding reader: a
+        # binding still held on the legacy `dashboard:`-spelled row would otherwise
+        # read as outbound-only and lose its inbound affordance.
+        mirrors = self._mirrors(self._data.get(self._mirror_key(key)))
+        if channel_type:
+            binding = mirrors.get(channel_type)
+            return bool(binding and binding.get("accepts_inbound"))
+        return any(b.get("accepts_inbound") for b in mirrors.values())
 
     def find_mirror_sessions(
         self,
@@ -476,11 +724,19 @@ class SessionMap:
         """
         matches: list[str] = []
         for key, entry in self._data.items():
-            raw = entry.get("mirror")
-            if not isinstance(raw, dict):
+            binding = self._mirrors(entry).get(link.channel_type)
+            if not binding:
                 continue
-            if inbound_only and not entry.get("mirror_accepts_inbound"):
+            if inbound_only and not binding.get("accepts_inbound"):
                 continue
+            raw = dict(binding)
+            raw.pop("accepts_inbound", None)
+            # A MUTED binding still occupies the location. Skipping it here would
+            # make a muted conversation look free: a second session could claim
+            # it, and the in-channel unlink the code tells the user to run would
+            # report nothing to clear.
+            raw.pop("paused", None)
+            raw.setdefault("channel_type", link.channel_type)
             try:
                 candidate = ChannelLink.from_dict(raw)
             except (TypeError, ValueError):
@@ -511,32 +767,55 @@ class SessionMap:
             entry = self._data.get(key)
             if entry is None:  # pragma: no cover - keys come from _data itself
                 continue
-            entry.pop("mirror", None)
-            entry.pop("mirror_accepts_inbound", None)
+            mirrors = self._mirrors(entry)
+            # Only the binding at THIS location: a session also mirroring to
+            # Telegram keeps that one. Popping the binding takes its mute with it,
+            # which is required — a mute describes a binding, and left behind it
+            # would silently mute whatever is bound here next.
+            mirrors.pop(link.channel_type, None)
+            self._write_mirrors(entry, mirrors)
             cleared.append(key)
         if cleared:
             self._save()
         return cleared
 
-    def clear_mirror_link(self, key: str) -> bool:
-        """Remove a session's outbound mirror binding; return True iff one existed.
+    def clear_mirror_link(self, key: str, channel_type: str = "") -> bool:
+        """Remove a session's binding(s); return True iff one existed.
 
-        A non-Slack ``mirror`` field is dropped directly; a Slack binding is
-        cleared via ``clear_slack_link`` so its reverse index is evicted too.
-        Resolves through :meth:`_mirror_key` so an unlink reaches a binding still
-        held under the legacy spelling — otherwise a mirror that reads as live
-        could not be turned off.
+        With a ``channel_type`` it removes only that binding, leaving siblings on
+        other channels alone; naming Slack clears the Slack link so its reverse
+        index is evicted too. With none it removes EVERY non-Slack binding (and
+        falls back to the Slack link), which is what the historical single-binding
+        contract meant. Resolves through :meth:`_mirror_key` so an unlink reaches a
+        binding still held under the legacy spelling — otherwise a mirror that
+        reads as live could not be turned off.
         """
         mkey = self._mirror_key(key)
         entry = self._data.get(mkey)
         if not entry:
             return False
-        if entry.get("mirror") is not None:
-            entry.pop("mirror", None)
-            entry.pop("mirror_accepts_inbound", None)
+        mirrors = self._mirrors(entry)
+        if channel_type:
+            if channel_type == SLACK_NAMESPACE:
+                return self.clear_slack_link(mkey)
+            removed = mirrors.pop(channel_type, None) is not None
+        else:
+            removed = bool(mirrors)
+            mirrors.clear()
+        if removed:
+            # Popping the binding takes its mute with it: same reason as
+            # clear_mirror_links_at, a mute must never outlive what it describes.
+            self._write_mirrors(entry, mirrors)
             self._save()
             return True
-        if entry.get("slack_thread_ts") or entry.get("slack_channel_id"):
+        # The Slack fall-through is for the UNNAMED clear only, which means "every
+        # binding". Naming a channel names the one you mean: if it holds nothing,
+        # the answer is False, not "clear Slack instead" — otherwise an in-channel
+        # `!unlink` on a channel with no binding would disconnect the session's
+        # Slack thread, which nobody asked about.
+        if not channel_type and (
+            entry.get("slack_thread_ts") or entry.get("slack_channel_id")
+        ):
             return self.clear_slack_link(mkey)
         return False
 

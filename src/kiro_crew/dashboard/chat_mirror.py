@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from typing import Any
 
 from aiohttp import web
 
@@ -32,7 +33,7 @@ from kiro_crew.dashboard.chat_backfill import (
 )
 from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _resolve_mirror_target
 from kiro_crew.dashboard.chat_slack import list_slack_channels
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import effective_session_key, mirror_is_paused
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import chunk_text
@@ -54,6 +55,60 @@ _FALLBACK_MAX_MESSAGE_CHARS = 4096
 # preview outright, so the cap only bites on pathologically long history, and it
 # keeps the request inside a browser fetch timeout.
 _MAX_INLINE_BACKFILL_UNITS = 12
+
+
+class _BadBody(Exception):
+    """A malformed request body, carrying the 400 to return for it."""
+
+    def __init__(self, response: web.Response) -> None:
+        super().__init__("malformed body")
+        self.response = response
+
+
+async def _read_json_body(request: web.Request) -> dict:
+    """Parse an optional JSON object body, or raise :class:`_BadBody` with a 400.
+
+    Reads the ACTUAL payload rather than branching on ``Content-Length``: a
+    chunked request carries a body with ``content_length is None``, so a
+    Content-Length test treats it as empty and silently drops whatever the caller
+    sent — which for these endpoints means falling back to the unnamed,
+    every-binding form of an operation the caller scoped to one channel.
+
+    An absent body is legal and yields ``{}``; only a body that is present and
+    unparseable is an error, so the empty-body reconnect keeps working.
+    """
+    try:
+        raw = (await request.text()).strip()
+    except (UnicodeDecodeError, LookupError):
+        # Invalid UTF-8, or an unknown charset in Content-Type: a malformed
+        # request, not a server fault — 400 rather than a 500 traceback.
+        raise _BadBody(
+            web.json_response(
+                {"error": "body must be valid UTF-8", "code": "body_not_utf8"}, status=400
+            )
+        )
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise _BadBody(
+            web.json_response(
+                {"error": "body must be valid JSON", "code": "body_not_json"}, status=400
+            )
+        )
+    if not isinstance(body, dict):
+        raise _BadBody(
+            web.json_response(
+                {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
+            )
+        )
+    return body
+
+
+def _body_channel_type(body: dict) -> str:
+    """The ``channel_type`` a scoped mirror operation names, or ``""`` for all."""
+    return str(body.get("channel_type") or "")
 
 
 async def api_channel_targets(request: web.Request) -> web.Response:
@@ -142,33 +197,61 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
     # again here — through the governed async send ladder — so a disconnect or
     # governance change between render and click fails closed at the side-effect
     # boundary.
-    if not body:
+    if not body or set(body) <= {"channel_type"}:
         session_key = effective_session_key(slot)
-        target = await asyncio.to_thread(_resolve_mirror_target, state, session_key)
+        # A reconnect names WHICH binding to bring back: a session can hold
+        # several, so an unnamed reconnect on a multi-bound session would pick an
+        # arbitrary sibling. get_mirror_link returns None rather than guess.
+        want = str(body.get("channel_type") or "")
+        target = await asyncio.to_thread(_resolve_mirror_target, state, session_key, want)
         if target is None:
-            existing = state.sessions.get_mirror_link(session_key)
+            existing = state.sessions.get_mirror_link(session_key, want)
             if existing is None:
                 return web.json_response({"error": "channel_type required"}, status=400)
             return web.json_response({"error": "mirror channel is not live"}, status=503)
         link, transport = target
-        try:
-            await transport.send_message(
-                link.channel_id,
-                "🔗 Session linked from dashboard — continuing here.",
-                thread_id=link.thread_id,
+        # An empty body on a session that already has a link is a RECONNECT, not
+        # a ping. It used to post "Session linked from dashboard — continuing
+        # here." for the "Post reminder" menu item, which no longer exists.
+        #
+        # Muted: lift it and catch the conversation up, because the gap in it is
+        # there precisely because delivery was off. set_mirror_link is what lifts
+        # the mute (a rebind never inherits one), so it runs AFTER the catch-up
+        # succeeds — a governance denial mid-delivery must leave the link exactly
+        # as it was.
+        if mirror_is_paused(state, session_key, link.channel_type):
+            denial = await _deliver_catch_up(state, slot, session_key, link, transport)
+            if denial is not None:
+                return denial
+            # accepts_inbound is re-asserted on every reconnect: a reply in that
+            # conversation must resume this session, and the flag lives ON the
+            # binding a rebind replaces.
+            state.sessions.set_mirror_link(session_key, link, accepts_inbound=True)
+            sel().log_api_access(
+                caller="dashboard",
+                operation="chat.mirror_reconnect",
+                outcome="success",
+                source="dashboard",
+                resources=f"{slot.key} -> {link.channel_type}",
             )
-        except Exception:
-            logger.debug("mirror-link reminder delivery failed", exc_info=True)
-            return web.json_response({"error": "failed to post reminder"}, status=502)
-        sel().log_api_access(
-            caller="dashboard",
-            operation="chat.mirror_reminder",
-            outcome="success",
-            source="dashboard",
-            resources=f"{slot.key} -> {link.channel_type}",
-        )
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "ok": True,
+                    "reconnected": True,
+                    "channel_type": link.channel_type,
+                    "conversation_id": link.channel_id,
+                }
+            )
+        # Already connected: a no-op, and silently so. Posting into the
+        # conversation here would be a stray message explaining nothing to
+        # whoever reads it.
         return web.json_response(
-            {"ok": True, "already_linked": True, "channel_type": link.channel_type}
+            {
+                "ok": True,
+                "already_linked": True,
+                "channel_type": link.channel_type,
+            }
         )
 
     if not channel_type:
@@ -239,6 +322,29 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         thread_id=thread_id,
     )
 
+    # ONE session per conversation, and this is checked BEFORE any side effect: a
+    # conversation has no threads to scope bindings to (a Discord DM cannot hold
+    # them at all), so two sessions bound here would leave an inbound message
+    # unroutable — the resolver refuses to pick and the message reaches nobody.
+    # Taking a conversation from another session is the user's call, so it is
+    # refused until they confirm rather than done silently.
+    occupants = [k for k in state.sessions.find_mirror_sessions(link) if k != session_key]
+    # `is True`, not truthiness: a JSON body carrying `{"confirm": "false"}` — or
+    # any non-empty string, or 0/1 from a sloppy client — would otherwise read as
+    # consent and evict another session's binding without the user ever seeing the
+    # prompt. Consent is a boolean or it is absent.
+    confirmed = body.get("confirm") is True
+    if occupants and not confirmed:
+        return web.json_response(
+            {
+                "error": "another session is connected to this conversation",
+                "code": "conversation_occupied",
+                "requires_confirm": True,
+                "occupied_by": len(occupants),
+            },
+            status=409,
+        )
+
     try:
         # Recheck at the actual send boundary as well: target resolution can
         # yield while governance is updated.
@@ -259,17 +365,114 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             {"error": "failed to create channel link", "code": "channel_link_failed"}, status=502
         )
 
-    # Build the ordered delivery units BEFORE the loop. Each unit is one Slack-
-    # free chunk of text, and the gap marker is a unit like any other, so every
-    # single thing that crosses the egress boundary gets its own governance
-    # re-check below rather than riding along on a message's decision.
-    #
+    # One shared catch-up path with the reconnect below, so a channel that has
+    # seen nothing and a channel with a gap are seeded identically. It fails
+    # closed: a mid-delivery governance denial comes back as the 403 to return,
+    # deliberately short of set_mirror_link so a denied binding never persists.
+    denial = await _deliver_catch_up(state, slot, session_key, link, live_transport)
+    if denial is not None:
+        return denial
+
+    # ── Commit. Everything from here to `set_mirror_link` runs with NO await ──
+    # The occupancy check above is separated from this write by three awaited
+    # sends (target resolution, the link notice, the catch-up), so it is a stale
+    # snapshot by now: two concurrent connects could both have passed it and would
+    # both persist an inbound binding, after which the resolver refuses to route
+    # and the conversation reaches NOBODY. Re-read at the commit point and keep the
+    # read, the eviction and the write in one synchronous run so nothing can bind
+    # between them.
+    late_occupants = [
+        k for k in state.sessions.find_mirror_sessions(link) if k != session_key
+    ]
+    if late_occupants and not confirmed:
+        # Someone took the conversation while we were delivering. The user
+        # confirmed nothing about THIS occupant, so ask rather than evicting a
+        # binding they were never shown.
+        return web.json_response(
+            {
+                "error": "another session is connected to this conversation",
+                "code": "conversation_occupied",
+                "requires_confirm": True,
+                "occupied_by": len(late_occupants),
+            },
+            status=409,
+        )
+    if late_occupants:
+        state.sessions.clear_mirror_links_at(link)
+
+    # accepts_inbound is what makes a reply in that conversation resume THIS
+    # session instead of starting a channel-born one. Without it the inbound
+    # resolver finds no owner and falls through to the conversation's own session
+    # key — the defect where connecting a session then replying in Discord landed
+    # in a brand-new tab.
+    state.sessions.set_mirror_link(
+        session_key,
+        link,
+        accepts_inbound=True,
+    )
+
+    # The binding is committed; awaits are safe again. The conversation is told
+    # because whoever is reading there needs to know which session they are now
+    # talking to. Best-effort: a failed notice must not fail a committed connect.
+    if late_occupants:
+        try:
+            await live_transport.send_message(
+                conversation_id,
+                "🔌 A different session is connected here now.",
+                thread_id=thread_id,
+            )
+        except Exception:
+            logger.debug("mirror-link eviction notice failed", exc_info=True)
+        sel().log_api_access(
+            caller="dashboard",
+            operation="chat.mirror_evict",
+            outcome="success",
+            source="dashboard",
+            resources=f"{slot.key} <- {','.join(late_occupants)}",
+        )
+        logger.info("mirror-link: evicted %s from %s", late_occupants, link.channel_type)
+    sel().log_api_access(
+        caller="dashboard",
+        operation="chat.mirror_link",
+        outcome="success",
+        source="dashboard",
+        resources=f"{slot.key} -> {channel_type}",
+    )
+    state.push_slots_update()
+    logger.info("mirror-link: %s -> %s:%s", slot.key, channel_type, conversation_id)
+    return web.json_response(
+        {"ok": True, "channel_type": channel_type, "conversation_id": conversation_id}
+    )
+
+
+async def _deliver_catch_up(
+    state: DashboardState,
+    slot: Any,
+    session_key: str,
+    link: ChannelLink,
+    transport: Any,
+) -> web.Response | None:
+    """Seed a channel with the history it has not seen. ``None`` on success.
+
+    Shared by the two paths that need it and MUST behave identically in both:
+    creating a link (the conversation has seen nothing) and reconnecting a muted
+    one (the conversation has a gap exactly where the mute was). Returning a
+    ``Response`` rather than raising keeps the fail-closed contract legible at
+    both call sites: a mid-delivery governance denial is a 403 the caller must
+    return WITHOUT persisting anything.
+
+    Every unit crosses the egress boundary as its own governed action — the gap
+    marker included — so policy narrowing while the loop yields stops delivery
+    instead of riding along on an earlier decision. The loop is inline and
+    bounded rather than backgrounded precisely because that per-unit denial has
+    to be able to fail the request closed.
+    """
     # Offloaded: selection reads the on-disk transcript when the opening turn is
     # off-window, and that read parses every tab_id sibling file. On the loop
     # thread it would stall every other chat turn and the liveness heartbeat.
     selection = await asyncio.to_thread(select_backfill_messages, state, slot)
     max_chars = (
-        getattr(getattr(live_transport, "capabilities", None), "max_message_chars", 0)
+        getattr(getattr(transport, "capabilities", None), "max_message_chars", 0)
         or _FALLBACK_MAX_MESSAGE_CHARS
     )
 
@@ -284,18 +487,6 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
         text = redact_via_context(backfill_content(row))
         return chunk_text(f"{speaker}: {text}", max_chars)
 
-    # Bound the INLINE delivery. Unlike the Slack drain this cannot be
-    # backgrounded -- the per-unit governance re-check below has to be able to
-    # fail the request closed with 403 -- so an unbounded loop would reintroduce
-    # the very defect backgrounding fixed on the Slack side: a rate-limited
-    # transport (Telegram is roughly one message per second) would hold the HTTP
-    # request open past the browser's fetch timeout and the user would see a
-    # failed link that had actually persisted.
-    #
-    # The budget is spent on WHOLE turns in priority order, and every turn it
-    # cannot afford is folded into the gap marker's count. Trimming composed
-    # units instead would cut a reply mid-sentence and could drop the marker
-    # itself -- the one line telling the reader history is missing.
     recent_turn_units = [
         [unit for row in turn for unit in _units_for(row)] for turn in selection.recent
     ]
@@ -355,7 +546,7 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
             deep_link = session_deep_link(cfg.dashboard.url, slot.key)
         except Exception:
-            logger.debug("mirror-link: could not build session link", exc_info=True)
+            logger.debug("catch-up: could not build session link", exc_info=True)
         units.append(f"… {summary} — {deep_link}" if deep_link else f"… {summary}")
     for turn_units in kept:
         units.extend(turn_units)
@@ -366,10 +557,9 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             # Stop immediately if policy narrows while the loop is yielding.
             governed = await asyncio.to_thread(_resolve_channel_target, state, session_key, link)
             if governed is None:
-                # Policy narrowed mid-delivery: fail closed. Do NOT fall
-                # through to set_mirror_link (which would persist a link the
-                # latest governance decision denied) and do NOT report
-                # success. The denial is already SEL-audited inside
+                # Policy narrowed mid-delivery: fail closed. The caller must NOT
+                # persist a link the latest governance decision denied, and must
+                # not report success. The denial is already SEL-audited inside
                 # _resolve_channel_target via vet_and_audit.
                 return web.json_response(
                     {"error": "channel is not permitted", "code": "channel_not_permitted"},
@@ -377,29 +567,65 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
                 )
             _, live_transport = governed
             await live_transport.send_message(
-                conversation_id,
+                link.channel_id,
                 unit,
-                thread_id=thread_id,
+                thread_id=link.thread_id,
             )
         except Exception:
-            logger.debug("mirror-link context delivery failed", exc_info=True)
+            logger.debug("catch-up delivery failed", exc_info=True)
+    return None
 
-    state.sessions.set_mirror_link(
-        session_key,
-        link,
-    )
+
+async def api_chat_slot_mirror_pause(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{name}/mirror-pause — mute the linked channel, keep the binding.
+
+    The channel-neutral twin of ``slack-pause``, and what the dashboard's single
+    row calls to DISCONNECT. The binding survives, so inbound routing is
+    untouched and the conversation still resolves to THIS session; only the
+    turn's outbound mirroring stops (see ``chat_utils.mirror_is_paused`` for the
+    exact scope, which is narrower than Slack's because no cron result,
+    sub-agent completion or auto-nudge tick reads the mirror link).
+
+    Resume by re-issuing ``mirror-link``, which lifts the mute and catches the
+    conversation up.
+
+    ``409`` when the session mirrors nowhere — returning ok would leave the UI
+    offering to disconnect something that was never connected. Idempotent,
+    reporting ``was_paused``. Nothing is posted into the conversation: the
+    dashboard shows the state, and this endpoint has no copy of its own.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info.get("name") or request.match_info.get("slot", "")
+    slot = state.get_slot(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    session_key = effective_session_key(slot)
+    try:
+        want = _body_channel_type(await _read_json_body(request))
+    except _BadBody as bad:
+        return bad.response
+    link = state.sessions.get_mirror_link(session_key, want)
+    # A Slack-only session synthesizes a Slack ChannelLink from its dedicated
+    # fields, which would pass this guard and then mute nothing — `mirrors` is
+    # empty, so the endpoint would answer ok/was_paused:false. Slack is muted
+    # through its own endpoint; refusing here keeps the reply honest.
+    if link is None or link.channel_type == SLACK_NAMESPACE:
+        return web.json_response(
+            {"error": "not linked", "code": "mirror_not_linked"}, status=409
+        )
+
+    was_paused = state.sessions.set_mirror_paused(session_key, True, want)
+    state.push_slots_update()
     sel().log_api_access(
         caller="dashboard",
-        operation="chat.mirror_link",
-        outcome="success",
+        operation="chat.mirror_pause",
+        outcome="noop" if was_paused else "success",
         source="dashboard",
-        resources=f"{slot.key} -> {channel_type}",
+        resources=slot.key,
     )
-    state.push_slots_update()
-    logger.info("mirror-link: %s -> %s:%s", slot.key, channel_type, conversation_id)
-    return web.json_response(
-        {"ok": True, "channel_type": channel_type, "conversation_id": conversation_id}
-    )
+    logger.info("mirror-pause: %s (was_paused=%s)", slot.key, was_paused)
+    return web.json_response({"ok": True, "was_paused": was_paused})
 
 
 async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
@@ -417,10 +643,18 @@ async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
     name = request.match_info.get("name") or request.match_info.get("slot", "")
     slot = state.get_slot(name)
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
     session_key = effective_session_key(slot)
-    cleared = state.sessions.clear_mirror_link(session_key)
+    # Scoped to the channel the caller names. The unnamed clear means EVERY
+    # binding, which under single-binding was the same thing — with several it
+    # would delete siblings the user never named (the chip labels one channel and
+    # would silently drop the rest, losing their `accepts_inbound` with them).
+    try:
+        want = _body_channel_type(await _read_json_body(request))
+    except _BadBody as bad:
+        return bad.response
+    cleared = state.sessions.clear_mirror_link(session_key, want)
     state.push_slots_update()
     sel().log_api_access(
         caller="dashboard",

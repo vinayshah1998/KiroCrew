@@ -282,6 +282,13 @@ class DiscordDispatcher:
         # the turn: a resumed dashboard session is not this conversation's own
         # session, and several steps below must not treat it as one.
         resumed_key = self._session_resume.resumed_session(channel_id)
+        if resumed_key is not None:
+            # A reply is the user talking to this session, so it lifts a mute the
+            # dashboard set — otherwise the message lands here and the answer is
+            # swallowed by the outbound gate, which reads as a dead channel. Runs
+            # after this dispatcher's inbound governance gate, and persists
+            # off-loop.
+            await self._session_resume.resume_if_muted(channel_id, resumed_key)
         session_key = resumed_key or self._session_key(user_id, thread_id)
         if self.sessions.is_busy(session_key):
             if resumed_key is not None:

@@ -85,6 +85,8 @@ from kiro_crew.dashboard.chat_utils import (
     _validate_tool_name,
     effective_session_key,
     is_system_injection,
+    mirror_is_paused,
+    slack_mirror_is_paused,
     slot_history_key,
 )
 from kiro_crew.dashboard.handlers import (
@@ -1560,13 +1562,49 @@ def _resolve_channel_target(state: Any, session_key: str, link: Any) -> Any:
     return link, transport
 
 
-def _resolve_mirror_target(state: Any, session_key: str) -> Any:
-    """Resolve a session's outbound mirror through the shared send ladder."""
+def _resolve_mirror_target(state: Any, session_key: str, channel_type: str = "") -> Any:
+    """Resolve ONE of a session's outbound bindings through the shared send ladder.
+
+    Named channel, or the session's only binding when unnamed — ``get_mirror_link``
+    returns None rather than an arbitrary sibling when several exist, so a caller
+    that assumes one binding can never deliver to the wrong channel.
+    """
     return _resolve_channel_target(
         state,
         session_key,
-        state.sessions.get_mirror_link(session_key),
+        state.sessions.get_mirror_link(session_key, channel_type)
+        if channel_type
+        else state.sessions.get_mirror_link(session_key),
     )
+
+
+def _resolve_mirror_targets(state: Any, session_key: str) -> list[Any]:
+    """Every deliverable binding a session holds, muted ones excluded.
+
+    The plural form is what turn mirroring needs now that a session can mirror to
+    several channels at once. Each binding is governed on its own through the
+    same ladder — one channel being denied, unregistered or unable to send
+    proactively must not stop the others — and each is mute-checked on its own,
+    because muting Discord may not silence a Telegram sibling.
+    """
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return []
+    try:
+        links = sessions.get_mirror_links(session_key)
+    except AttributeError:
+        # Older/stubbed SessionManagers (and much of the test suite) expose only
+        # the singular accessor; degrade to it rather than dropping delivery.
+        single = sessions.get_mirror_link(session_key)
+        links = [single] if single is not None else []
+    targets: list[Any] = []
+    for link in links:
+        if mirror_is_paused(state, session_key, link.channel_type):
+            continue
+        resolved = _resolve_channel_target(state, session_key, link)
+        if resolved is not None:
+            targets.append(resolved)
+    return targets
 
 
 def _mark_kiro_signed_out(state: Any) -> None:
@@ -1605,6 +1643,11 @@ async def _deliver_auth_error_to_slack(
     slack_client = getattr(state, "slack_client", None)
     if slack_client is None:
         return
+    # A paused thread is muted for turn output, and an auth failure IS turn
+    # output. The dashboard renders the same error, which is where a user who
+    # paused the thread is working.
+    if slack_mirror_is_paused(state, session_key):
+        return
     thread_ts = getattr(slot, "_slack_thread_ts", "")
     channel_id = getattr(slot, "_slack_channel", "")
     if (not thread_ts or not channel_id) and sessions is not None:
@@ -1634,29 +1677,35 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     """
     if not assistant_text:
         return
-    target = _resolve_mirror_target(state, session_key)
-    if target is None:
+    # Every connected binding gets the reply; muted ones are filtered inside the
+    # resolver, per binding, so muting Discord leaves a Telegram sibling live.
+    # Gated at the SEND, not in routing — chat_mirror resolves the same targets to
+    # deliver a reconnect's catch-up.
+    targets = _resolve_mirror_targets(state, session_key)
+    if not targets:
         return
-    link, transport = target
     # Redact through the canonical egress shim so a loaded companion's extra
     # credential/token regexes apply (not just the OSS baseline).
     text = redact_via_context(assistant_text)
-    # Split on the channel's max message length so a long reply mirrors in full
-    # rather than being hard-truncated by the transport (Telegram caps at 4096),
-    # matching the Slack leg's split_message chunking.
-    parts = chunk_text(text, transport.capabilities.max_message_chars)
-    try:
-        for part in parts:
-            await transport.send_message(link.channel_id, part, thread_id=link.thread_id)
-        logger.info(
-            "cross-surface: mirrored reply to %s:%s (%d chars, %d part(s))",
-            link.channel_type,
-            link.channel_id,
-            len(text),
-            len(parts),
-        )
-    except Exception:
-        logger.debug("Failed to mirror reply to %s", link.channel_type, exc_info=True)
+    for link, transport in targets:
+        # Split on the channel's max message length so a long reply mirrors in
+        # full rather than being hard-truncated by the transport (Telegram caps
+        # at 4096), matching the Slack leg's split_message chunking. Per channel:
+        # limits differ, so one shared split would cut for the strictest.
+        parts = chunk_text(text, transport.capabilities.max_message_chars)
+        try:
+            for part in parts:
+                await transport.send_message(link.channel_id, part, thread_id=link.thread_id)
+            logger.info(
+                "cross-surface: mirrored reply to %s:%s (%d chars, %d part(s))",
+                link.channel_type,
+                link.channel_id,
+                len(text),
+                len(parts),
+            )
+        except Exception:
+            # One channel failing must not cost the others their delivery.
+            logger.debug("Failed to mirror reply to %s", link.channel_type, exc_info=True)
 
 
 async def _deliver_cross_surface_user_message(
@@ -1673,23 +1722,26 @@ async def _deliver_cross_surface_user_message(
     """
     if not user_message:
         return
-    target = _resolve_mirror_target(state, session_key)
-    if target is None:
+    targets = _resolve_mirror_targets(state, session_key)
+    if not targets:
         return
-    link, transport = target
-    try:
-        await transport.send_message(
-            link.channel_id,
-            f"💬 {_prepare_mirror_msg(user_message)}",
-            thread_id=link.thread_id,
-        )
-        logger.info(
-            "cross-surface: mirrored user message to %s:%s",
-            link.channel_type,
-            link.channel_id,
-        )
-    except Exception:
-        logger.debug("Failed to mirror user message to %s", link.channel_type, exc_info=True)
+    echo = f"💬 {_prepare_mirror_msg(user_message)}"
+    for link, transport in targets:
+        try:
+            await transport.send_message(
+                link.channel_id,
+                echo,
+                thread_id=link.thread_id,
+            )
+            logger.info(
+                "cross-surface: mirrored user message to %s:%s",
+                link.channel_type,
+                link.channel_id,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to mirror user message to %s", link.channel_type, exc_info=True
+            )
 
 
 def _prepare_mirror_msg(raw_user_message: str) -> str:
@@ -2393,6 +2445,9 @@ async def _run_chat(
             link = sessions.get_slack_link(raw_key)
             if link and link[0] and link[1]:
                 sessions.set_slack_link(session_key, link[0], link[1])
+                # No pause copy needed: SessionMap keys a pause under both the
+                # bare and the "dashboard:"-prefixed spelling, so the flag gates
+                # this turn from whichever one carries it.
 
     # No pre-turn readiness gate: latched readiness is only refreshed at boot and
     # on explicit user action, so denying here would block a send the CLI would
@@ -3380,7 +3435,15 @@ async def _run_chat(
         )
 
         # ── Bidirectional sync: mirror user message to linked Slack thread ──
-        if state.slack_client and not is_slash and not _is_synthetic:
+        # A paused link stops here and nowhere else: _mirror_thread/_mirror_chan
+        # and _mirror_stream_ts stay empty, which is what also silences the tool
+        # stream, the assistant reply, and the stream teardown further down.
+        if (
+            state.slack_client
+            and not is_slash
+            and not _is_synthetic
+            and not slack_mirror_is_paused(state, session_key)
+        ):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
                 try:
@@ -4502,6 +4565,7 @@ async def _run_chat(
                     and slot._slack_channel
                     and slot._slack_thread_ts
                     and state.slack_client
+                    and not slack_mirror_is_paused(state, session_key)
                 ):
                     try:
                         _slack_approval_ts = await post_linked_approval(

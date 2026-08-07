@@ -36,6 +36,98 @@ def _fake_transport(channel_type: str = "telegram", proactive: bool = True):
     )
 
 
+def _bind(state, *links):
+    """Stub BOTH mirror accessors so the double matches the real interface.
+
+    Outbound delivery reads ``get_mirror_links`` (a session can hold several
+    bindings); callers that know they mean one still read ``get_mirror_link``,
+    which returns None rather than an arbitrary sibling when several exist.
+    """
+    state.sessions.get_mirror_links = MagicMock(return_value=list(links))
+    state.sessions.get_mirror_link = MagicMock(
+        return_value=links[0] if len(links) == 1 else None
+    )
+
+
+class TestSeveralChannelsAtOnce:
+    """A session can mirror to several channels, and each stands on its own.
+
+    Three independent properties, all of which a single-target implementation
+    would have silently broken: delivery fans out, one channel's failure does not
+    cost the others their message, and a per-binding mute silences only its own.
+    """
+
+    @staticmethod
+    def _two(tmp_path, *, discord_paused=False, telegram_paused=False):
+        state = _make_state(tmp_path)
+        discord = _fake_transport("discord")
+        telegram = _fake_transport("telegram")
+        state.register_channel_transport(discord)
+        state.register_channel_transport(telegram)
+        links = [
+            ChannelLink("discord", channel_id="D1"),
+            ChannelLink("telegram", channel_id="T1"),
+        ]
+        state.sessions.get_mirror_links = MagicMock(return_value=links)
+        state.sessions.is_mirror_paused = MagicMock(
+            side_effect=lambda _key, channel_type="": (
+                discord_paused if channel_type == "discord" else telegram_paused
+            )
+        )
+        return state, discord, telegram
+
+    @pytest.mark.asyncio
+    async def test_the_reply_reaches_every_connected_channel(self, tmp_path):
+        state, discord, telegram = self._two(tmp_path)
+        await _deliver_cross_surface_reply(state, "dashboard:chat-1", "the answer")
+        discord.send_message.assert_awaited_once_with("D1", "the answer", thread_id=None)
+        telegram.send_message.assert_awaited_once_with("T1", "the answer", thread_id=None)
+
+    @pytest.mark.asyncio
+    async def test_the_user_echo_reaches_every_connected_channel(self, tmp_path):
+        state, discord, telegram = self._two(tmp_path)
+        await _deliver_cross_surface_user_message(state, "dashboard:chat-1", "my question")
+        assert discord.send_message.await_count == 1
+        assert telegram.send_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_muting_one_channel_leaves_the_other_delivering(self, tmp_path):
+        state, discord, telegram = self._two(tmp_path, discord_paused=True)
+        await _deliver_cross_surface_reply(state, "dashboard:chat-1", "the answer")
+        discord.send_message.assert_not_awaited()
+        telegram.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_one_channel_failing_does_not_cost_the_other_its_message(self, tmp_path):
+        state, discord, telegram = self._two(tmp_path)
+        discord.send_message = AsyncMock(side_effect=RuntimeError("discord down"))
+        await _deliver_cross_surface_reply(state, "dashboard:chat-1", "the answer")
+        telegram.send_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_each_channel_is_split_at_its_own_length_limit(self, tmp_path):
+        """One shared split would cut every channel at the strictest limit."""
+        state = _make_state(tmp_path)
+        roomy = _fake_transport("discord")
+        roomy.capabilities.max_message_chars = 4000
+        tight = _fake_transport("telegram")
+        tight.capabilities.max_message_chars = 100
+        state.register_channel_transport(roomy)
+        state.register_channel_transport(tight)
+        state.sessions.get_mirror_links = MagicMock(
+            return_value=[
+                ChannelLink("discord", channel_id="D1"),
+                ChannelLink("telegram", channel_id="T1"),
+            ]
+        )
+        state.sessions.is_mirror_paused = MagicMock(return_value=False)
+
+        await _deliver_cross_surface_reply(state, "dashboard:chat-1", "x" * 350)
+
+        assert roomy.send_message.await_count == 1
+        assert tight.send_message.await_count > 1
+
+
 class TestGovernanceDegradationFailsClosed:
     """A degraded governance evaluation must DENY the mirror egress, not permit it.
 
@@ -56,9 +148,7 @@ class TestGovernanceDegradationFailsClosed:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123", thread_id=None)
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123", thread_id=None))
 
         await _deliver_cross_surface_reply(state, "dashboard:chat-1", "hi there")
 
@@ -73,9 +163,7 @@ class TestGovernanceDegradationFailsClosed:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123", thread_id=None)
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123", thread_id=None))
 
         await _deliver_cross_surface_reply(state, "dashboard:chat-1", "hi there")
 
@@ -98,9 +186,7 @@ class TestGovernanceDegradationFailsClosed:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123", thread_id=None)
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123", thread_id=None))
 
         with pytest.raises(PlatformCompositionError):
             await _deliver_cross_surface_reply(state, "dashboard:chat-1", "hi there")
@@ -141,9 +227,7 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123", thread_id=None)
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123", thread_id=None))
         await _deliver_cross_surface_reply(state, "dashboard:chat-1", "hi there")
         tp.send_message.assert_awaited_once_with("123", "hi there", thread_id=None)
 
@@ -152,9 +236,7 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="C", thread_id="T")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="C", thread_id="T"))
         await _deliver_cross_surface_reply(state, "k", "x")
         tp.send_message.assert_awaited_once_with("C", "x", thread_id="T")
 
@@ -163,24 +245,20 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("slack")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("slack", channel_id="C1", thread_id="ts")
-        )
+        _bind(state, ChannelLink("slack", channel_id="C1", thread_id="ts"))
         await _deliver_cross_surface_reply(state, "k", "hi")
         tp.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_when_no_link(self, tmp_path):
         state = _make_state(tmp_path)
-        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        _bind(state)
         await _deliver_cross_surface_reply(state, "k", "hi")  # must not raise
 
     @pytest.mark.asyncio
     async def test_skips_when_transport_unregistered(self, tmp_path):
         state = _make_state(tmp_path)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_reply(state, "k", "hi")  # telegram not registered
 
     @pytest.mark.asyncio
@@ -188,9 +266,7 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("wecom", proactive=False)
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("wecom", channel_id="u1")
-        )
+        _bind(state, ChannelLink("wecom", channel_id="u1"))
         await _deliver_cross_surface_reply(state, "k", "hi")
         tp.send_message.assert_not_awaited()
 
@@ -199,9 +275,7 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_reply(state, "k", "")
         tp.send_message.assert_not_awaited()
         state.sessions.get_mirror_link.assert_not_called()
@@ -211,9 +285,7 @@ class TestDeliverCrossSurfaceReply:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         raw = "see https://evil.example/exfil?q=1 and AKIAIOSFODNN7EXAMPLE"
         expected = redact_credentials(redact_exfiltration_urls(raw)[0])[0]
         await _deliver_cross_surface_reply(state, "k", raw)
@@ -225,9 +297,7 @@ class TestDeliverCrossSurfaceReply:
         tp = _fake_transport("telegram")
         tp.send_message = AsyncMock(side_effect=RuntimeError("boom"))
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_reply(state, "k", "hi")  # must not raise
 
     @pytest.mark.asyncio
@@ -236,9 +306,7 @@ class TestDeliverCrossSurfaceReply:
         tp = _fake_transport("telegram")
         tp.capabilities.max_message_chars = 100
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         long_text = "x" * 250
         await _deliver_cross_surface_reply(state, "k", long_text)
         # 250 chars / 100 per chunk = 3 sends; content preserved end-to-end and
@@ -256,9 +324,7 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123", thread_id=None)
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123", thread_id=None))
         await _deliver_cross_surface_user_message(state, "k", "hello there")
         tp.send_message.assert_awaited_once_with("123", "💬 hello there", thread_id=None)
 
@@ -267,9 +333,7 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="C", thread_id="T")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="C", thread_id="T"))
         await _deliver_cross_surface_user_message(state, "k", "x")
         tp.send_message.assert_awaited_once_with("C", "💬 x", thread_id="T")
 
@@ -278,24 +342,20 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("slack")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("slack", channel_id="C1", thread_id="ts")
-        )
+        _bind(state, ChannelLink("slack", channel_id="C1", thread_id="ts"))
         await _deliver_cross_surface_user_message(state, "k", "hi")
         tp.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_when_no_link(self, tmp_path):
         state = _make_state(tmp_path)
-        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        _bind(state)
         await _deliver_cross_surface_user_message(state, "k", "hi")  # must not raise
 
     @pytest.mark.asyncio
     async def test_skips_when_transport_unregistered(self, tmp_path):
         state = _make_state(tmp_path)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_user_message(state, "k", "hi")
 
     @pytest.mark.asyncio
@@ -303,9 +363,7 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("wecom", proactive=False)
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("wecom", channel_id="u1")
-        )
+        _bind(state, ChannelLink("wecom", channel_id="u1"))
         await _deliver_cross_surface_user_message(state, "k", "hi")
         tp.send_message.assert_not_awaited()
 
@@ -314,9 +372,7 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_user_message(state, "k", "")
         tp.send_message.assert_not_awaited()
         state.sessions.get_mirror_link.assert_not_called()
@@ -326,9 +382,7 @@ class TestDeliverCrossSurfaceUserMessage:
         state = _make_state(tmp_path)
         tp = _fake_transport("telegram")
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         raw = "tok AKIAIOSFODNN7EXAMPLE " + "x" * 800
         await _deliver_cross_surface_user_message(state, "k", raw)
         sent = tp.send_message.await_args.args[1]
@@ -344,7 +398,5 @@ class TestDeliverCrossSurfaceUserMessage:
         tp = _fake_transport("telegram")
         tp.send_message = AsyncMock(side_effect=RuntimeError("boom"))
         state.register_channel_transport(tp)
-        state.sessions.get_mirror_link = MagicMock(
-            return_value=ChannelLink("telegram", channel_id="123")
-        )
+        _bind(state, ChannelLink("telegram", channel_id="123"))
         await _deliver_cross_surface_user_message(state, "k", "hi")  # must not raise
