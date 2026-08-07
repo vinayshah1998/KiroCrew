@@ -103,6 +103,7 @@
       "mochi/shortcuts.js",
       "mochi/pageUrl.js",
       "mochi/instanceGate.js",
+      "mochi/machineStore.js",
       "crew-companion/index.js",
       "crew-companion/petOverlay.js",
       "crew-companion/pageUrl.js",
